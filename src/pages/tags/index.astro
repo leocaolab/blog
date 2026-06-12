@@ -1,0 +1,26 @@
+---
+import { getCollection } from "astro:content"
+import BaseLayout from "../../layouts/BaseLayout.astro"
+
+const posts = await getCollection("posts", ({ data }) => !data.draft)
+const counts = new Map<string, number>()
+for (const post of posts) {
+  for (const tag of post.data.tags) {
+    counts.set(tag, (counts.get(tag) ?? 0) + 1)
+  }
+}
+const tags = [...counts.entries()].sort((a, b) => b[1] - a[1])
+---
+
+<BaseLayout title="Topics" description="Browse posts by topic.">
+  <h1>Topics</h1>
+  <div class="tags">
+    {
+      tags.map(([tag, count]) => (
+        <a href={`/tags/${tag}/`} class="tag">
+          #{tag} <span class="muted">({count})</span>
+        </a>
+      ))
+    }
+  </div>
+</BaseLayout>

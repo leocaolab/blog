@@ -1,0 +1,103 @@
+---
+title: "The 128-byte leak that OOM'd my Python server every 10 minutes"
+description: "A per-request memory leak in a sub-interpreter web server, traced to a CPython thread-state quirk — and the 13-line fix that killed it."
+date: 2026-06-12
+tags: ["python", "sub-interpreters", "performance", "debugging", "rust"]
+draft: false
+# youtube: "REPLACE_WITH_VIDEO_ID"  # uncomment when the companion video is up
+---
+
+Pyronova is a Python web server built on Python 3.13+ per-interpreter GILs
+(PEP 684): N independent sub-interpreters in **one** process, each with its own
+GIL, so CPU-bound Python runs on every core without the per-process memory tax
+of `multiprocessing`. On an 8-core laptop it does ~429k req/s in 189 MB of RAM.
+
+It also leaked **128 bytes per request**. At 400k req/s that's ~50 MB/s. The
+process reached OOM in about ten minutes.
+
+This is the story of finding it, and the 13-line fix.
+
+## The symptom
+
+Under sustained load, RSS climbed in a dead-straight line — no plateau, no GC
+sawtooth. Straight lines are the tell-tale of a per-event leak: something is
+allocated once per request and never reclaimed. Back-of-envelope from the slope:
+**~128 B/request**. Small enough to survive every smoke test, fatal under real
+traffic.
+
+## What it wasn't
+
+A leak in a refcounted runtime is usually your own dangling references, so I
+ruled those out first:
+
+- **Handler-level objects** — `gc.get_objects()` counts were flat across
+  requests. Not Python-visible garbage.
+- **Rust-side allocations** — heap profiling showed no growth in the Rust
+  request path.
+- **The response buffers** — zero-copy `Bytes`, freed correctly.
+
+The leak was *below* anything Python or my Rust code could see. That pointed at
+the C-API boundary itself.
+
+## The root cause: cross-thread `PyThreadState` reuse
+
+Here's the architecture detail that mattered. Each sub-interpreter's
+`PyThreadState` was created on the **main OS thread** at startup, then handed to
+a **worker thread** which attached/detached it per request via
+`PyEval_RestoreThread` / `PyEval_SaveThread`.
+
+That works — but it's not how CPython expects thread states to be used. A
+`PyThreadState` is bound to the thread that created it. Reusing one across a
+different OS thread makes CPython's per-thread bookkeeping accumulate state on
+every attach/detach cycle — on the order of ~1 KB per cycle that is never
+reclaimed. (It also quietly broke `__del__` / `tp_finalize` in handlers, which
+had been sitting as an `xfail`'d test — same root cause.)
+
+I confirmed it with a pure-C reproducer outside the server: create an
+interpreter's tstate on one thread, attach/detach it from another in a loop,
+watch RSS climb. No Rust, no Pyronova, no HTTP. Just CPython.
+
+## The fix: rebind the tstate to the worker thread
+
+The fix is to stop reusing the creator's thread state. Each worker, **once** at
+loop entry, creates its own fresh `PyThreadState` for the interpreter and
+disposes of the inherited one:
+
+```rust
+// rebind_tstate_to_current_thread(creator_tstate) -> fresh tstate
+PyEval_RestoreThread(creator);          // attach the inherited tstate
+let fresh = PyThreadState_New(interp);  // fresh tstate, owned by THIS thread
+PyThreadState_Swap(fresh);              // switch onto it
+PyThreadState_Clear(creator);
+PyThreadState_Delete(creator);          // dispose of the inherited one
+PyEval_SaveThread();                    // release the GIL, hand back `fresh`
+```
+
+Thirteen lines, called once per worker. After that, every request uses a thread
+state that actually belongs to the thread running it, so CPython's bookkeeping
+has nothing to accumulate.
+
+## The result
+
+| | before | after |
+| --- | --- | --- |
+| leak rate | 128 B/req | **0.057 B/req** |
+| 73.8M requests | ~10 GB growth | **4 MB** growth |
+| time to OOM @ 400k rps | ~10 min | none |
+
+0.057 B/req is below the measurement noise floor — effectively zero. As a bonus,
+`__del__` now fires correctly in handlers, and the stable thread state shaved a
+couple percent off throughput at 400k rps by avoiding per-request reacquisition.
+
+## The lesson
+
+The bug wasn't in my code. It was in a wrong assumption about a C-API contract:
+*"a thread state is just a handle I can move between threads."* It isn't. In a
+refcounted, GIL-managed runtime, the invariants live below your abstractions —
+and a straight RSS line is the cheapest oscilloscope you have for finding where.
+
+---
+
+*Pyronova is open source — [code on GitHub](https://github.com/leocaolab).
+If sub-interpreters are new to you, the [primer](https://github.com/leocaolab)
+walks through PEP 684 from scratch.*

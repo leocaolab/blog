@@ -1,0 +1,37 @@
+---
+import { getCollection } from "astro:content"
+import BaseLayout from "../layouts/BaseLayout.astro"
+import { SITE } from "../consts.ts"
+
+const posts = (await getCollection("posts", ({ data }) => !data.draft)).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+)
+const recent = posts.slice(0, 5)
+const fmt = (d: Date) =>
+  d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+---
+
+<BaseLayout title={SITE.title} description={SITE.description}>
+  <section class="intro">
+    <h1>{SITE.title}</h1>
+    <p>{SITE.description}</p>
+  </section>
+
+  <section>
+    <h2>Latest</h2>
+    <ul class="post-list">
+      {
+        recent.map((post) => (
+          <li>
+            <a href={`/blog/${post.id}/`}>{post.data.title}</a>
+            <time datetime={post.data.date.toISOString()}>
+              {fmt(post.data.date)}
+            </time>
+            <p class="muted">{post.data.description}</p>
+          </li>
+        ))
+      }
+    </ul>
+    <p><a href="/blog">All writing →</a></p>
+  </section>
+</BaseLayout>

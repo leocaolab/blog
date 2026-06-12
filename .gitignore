@@ -1,0 +1,19 @@
+# build output
+dist/
+.astro/
+
+# deps
+node_modules/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# os / editor
+.DS_Store
+*.log
+
+# GUARDRAIL: unpublished drafts and any internal strategy notes never go public.
+# Keep work-in-progress here; promote to src/content/posts/ only when finished.
+drafts/

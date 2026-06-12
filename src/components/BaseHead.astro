@@ -1,0 +1,77 @@
+---
+import { SITE } from "../consts.ts"
+
+interface Props {
+  title: string
+  description: string
+  ogImage?: string
+  // ISO date string for Article JSON-LD; omit for non-article pages.
+  publishedTime?: string
+  type?: "website" | "article"
+}
+
+const {
+  title,
+  description,
+  ogImage = "/og-default.png",
+  publishedTime,
+  type = "website",
+} = Astro.props
+
+const canonical = new URL(Astro.url.pathname, Astro.site)
+const ogUrl = new URL(ogImage, Astro.site)
+const fullTitle = title === SITE.title ? title : `${title} — ${SITE.title}`
+
+const jsonLd =
+  type === "article"
+    ? {
+        "@context": "https://schema.org",
+        "@type": "BlogPosting",
+        headline: title,
+        description,
+        author: { "@type": "Person", name: SITE.author },
+        datePublished: publishedTime,
+        image: ogUrl.toString(),
+        url: canonical.toString(),
+      }
+    : null
+---
+
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="canonical" href={canonical} />
+<link
+  rel="alternate"
+  type="application/rss+xml"
+  title={SITE.title}
+  href={new URL("/rss.xml", Astro.site)}
+/>
+<meta name="generator" content={Astro.generator} />
+
+<title>{fullTitle}</title>
+<meta name="title" content={fullTitle} />
+<meta name="description" content={description} />
+<meta name="author" content={SITE.author} />
+
+<!-- Open Graph -->
+<meta property="og:type" content={type} />
+<meta property="og:url" content={canonical} />
+<meta property="og:title" content={fullTitle} />
+<meta property="og:description" content={description} />
+<meta property="og:image" content={ogUrl} />
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content={fullTitle} />
+<meta name="twitter:description" content={description} />
+<meta name="twitter:image" content={ogUrl} />
+
+{
+  jsonLd && (
+    <script
+      type="application/ld+json"
+      set:html={JSON.stringify(jsonLd)}
+    />
+  )
+}
