@@ -2,7 +2,7 @@
 # One-click publish for leocaolab.com.
 #
 # Build-checks the site (fail fast on broken MDX/frontmatter), then commits &
-# pushes. Cloudflare Pages auto-builds on push to `main` and deploys in ~1-2 min.
+# pushes. Cloudflare Workers Builds auto-builds on push to `main` and deploys in ~1-2 min.
 # drafts/, node_modules/, dist/ are gitignored, so `git add -A` won't leak a draft.
 #
 # Usage:  bash scripts/publish.sh "post: why we don't support MCP"
@@ -20,4 +20,4 @@ git add -A
 git commit -m "$msg"
 git push
 
-echo "✓ pushed — Cloudflare Pages deploys in ~1-2 min → https://leocaolab.com/blog"
+echo "✓ pushed — Cloudflare deploys in ~1-2 min → https://leocaolab-blog.hucao1.workers.dev"
