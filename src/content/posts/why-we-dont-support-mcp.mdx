@@ -1,0 +1,193 @@
+---
+title: "Why we don't support MCP"
+description: "A type-theory and security case against the Model Context Protocol — a flat Json→Text bag with no composition law, reinventing HTTP and RPC a little worse. And what an embeddable, strongly-typed agent runtime does instead."
+date: 2026-07-06
+tags: ["ai", "agents", "mcp", "architecture", "type-systems", "rust"]
+draft: false
+---
+
+Every decade or so, software's finest minds gather to solve the same problem —
+*how do I get my system to talk to your system?* — and every decade they reach for
+the same answer: a universal middleware that will wrap the whole world in one
+protocol, after which everything will simply, magically, talk.
+
+In the 1990s it was **CORBA**: an interface definition language, object request
+brokers, a wire protocol called IIOP, and the glorious promise that any object could
+call any other object, in any language, on any machine, as if they shared a room.
+Then **SOAP** and **WSDL** — an envelope so heavy it needed its own postman. Then the
+**Enterprise Service Bus** and the whole **SOA** gold rush: a decade of consultancy
+money spent wrapping every creaking system in a "service" so a bus in the middle could
+route between them.
+
+Where are they now? CORBA is a ghost story told to frighten graduates. SOAP is a
+punchline. The ESB is a line item in a 2009 migration budget nobody wants to discuss.
+All three died of the same disease, and it's worth naming, because we're about to watch
+it kill a fourth patient:
+
+1. **The universal wrapper never removed the complexity — it just moved it,** from the
+   caller (who now had it easy) onto some exhausted soul maintaining the wrapper.
+2. **A simpler substrate turned up and ate them.** Plain HTTP, JSON, a text editor and
+   a `curl` did ninety per cent of the job with none of the ceremony.
+
+Hold that thought.
+
+## Enter MCP — and how agents actually work
+
+The Model Context Protocol is 2024's reincarnation of the universal plug. On paper it's
+tidy: a server advertises a list of tools, a client calls one by name, JSON goes in,
+"content" comes back. The ecosystem is huge — tens of thousands of listed servers, SDK
+downloads in the tens of millions a month. It has become, as its evangelists never tire
+of saying, "the USB-C port of AI."
+
+So watch what a *capable* agent does when you hand it a real task. It asks for a shell.
+It types `gh pr view 412 --json files`. It writes `SELECT id, total FROM orders WHERE
+status = 'stuck'`. It `curl`s the Stripe API with a key it read from the environment. It
+reads the OpenAPI spec, or the SDK's docstrings, and it just… calls the thing.
+
+What it does *not* do is ask for a pre-digested catalogue of 400 tool descriptions so it
+can guess which one to invoke. The frontier coding agents already route around MCP
+entirely, because a shell and a good SDK is a stronger, faster, more honest interface
+than a bag of JSON-RPC wrappers.
+
+## The type-level indictment
+
+Take MCP seriously *as a type* and it deflates in your hands:
+
+```
+Server  ≈  { tools : List<(Name, JsonSchema_in, Description)> }
+call    :  (Name, Json) -> Result<Content[], Error>
+Content =  Text | Image | Audio | ResourceLink | EmbeddedResource
+```
+
+The effective type of every tool is **`Json → Text`**. The schema is runtime metadata,
+not a static type. The return is dominated by `Text`. `structuredContent` is a bolted-on
+afterthought you opt into. Three consequences:
+
+**It's inert.** MCP contributes zero intelligence. Its whole operational semantics are
+"a model reads a sentence of English and *guesses* which name to call." Unplug the LLM
+and nothing is left but a phone book.
+
+**It's stringly-typed.** One verb, `call`, over a flat namespace. No coproduct (you can't
+type "A *or* B"), no product (you can't type "A's output *is* B's input"). Domain types
+are erased into JSON and prose, so you never hold a value you can trust — you hold a blob
+you *hope* parses.
+
+**Its "extensibility" is width, not depth.** MCP's celebrated extensibility is "append
+another `Json → Text` entry to the list." There's no combinator — no
+
+```
+compose : Tool a b -> Tool b c -> Tool a c
+```
+
+Two MCP tools cannot be joined into a third. Composition happens only inside the model's
+head, imperatively, re-derived every single turn. It is not an algebra; it is a set of
+morphisms with the compose button removed. The entire point of a good abstraction is that
+its pieces click together. MCP threw that away and kept the packaging.
+
+(In fairness: MCP has more than `tools/call` — `resources`, `prompts`, a whiff of
+bidirectionality in `sampling`. But those are barely used in the wild and they widen the
+bag without adding a compose law. A bigger bag is still a bag.)
+
+## Why not even as a client? The Stripe test
+
+"Fine," says the advocate, "don't build servers — just *consume* other people's." No. If
+you can write code, a direct call beats an MCP call on every axis that matters: typed,
+in-process, sandboxable, no extra hop, no daemon, no schema round-trip.
+
+Run the **Stripe test**. *Why not just call Stripe's public REST API — can't the agent do
+that?* Of course it can. A Stripe MCP server adds only two things: **curation** (trimming
+hundreds of endpoints to a few "safe" ones with LLM-friendly blurbs — a guardrail, not a
+capability) and **holding the key** out of the model's context. Both of which you do
+*better* in your own code. Stripe is in fact the *worst* case for MCP, precisely because
+its REST API is world-class — there's nothing left for the wrapper to add.
+
+Which gives us the governing law, and it's a cruel one:
+
+> **The value of an MCP server is inversely proportional to the capability of the agent
+> calling it.**
+
+MCP is scaffolding for a *weak* agent that can't yet read a doc, open a shell, and call an
+API. As agents get strong — and they are, frighteningly fast — the scaffolding becomes
+dead weight. Structurally, it's a bet against the very thing everyone is racing to build.
+
+## The 2026 reality check
+
+Everything above is the architectural case, and you might dismiss it as purism. So how does
+MCP behave in the wild?
+
+First, an honest note, because I went looking for numbers and found a minefield. Plenty of
+alarming statistics circulate in 2026 blog posts — "X% of servers vulnerable to Y," "N CVEs
+in sixty days" — and I could not trace most of them to a primary source; at least one
+widely-echoed figure turned out to be a language model's extrapolation that bounced around
+the low-authority web until it looked like a fact. So I'll cite only what checks out, and
+lean on structure for the rest.
+
+What checks out: **[OWASP now publishes a dedicated MCP Top 10](https://owasp.org/www-project-mcp-top-10/)**
+(MCP01–MCP10:2025). Read the list — Token & Secret Exposure, Excessive Agent Permissions,
+Tool Poisoning, Supply-Chain / Dependency Tampering, Command Injection, Prompt Injection,
+Insufficient Auth, Lack of Audit, Shadow MCP Servers, Context Over-Sharing — and every
+entry is the *predictable* consequence of the design: an untyped server that takes a
+stochastic model's output as control input, shipped as thousands of community packages you
+install by name. Path traversal and command injection are what you get when "the model asked
+for a file / a command and the wrapper obliged." And it's not hypothetical:
+**[CVE-2025-6514](https://nvd.nist.gov/vuln/detail/CVE-2025-6514)** (CVSS 9.6, reported by
+JFrog) is documented OS-command-injection RCE on the *client* machine, simply from connecting
+to an untrusted MCP server.
+
+Then there's the plumbing. Strip the branding and MCP is JSON-RPC over HTTP (or stdio) with a
+`tools/list` discovery call bolted on — which is to say, it's **reinventing HTTP, REST, and
+RPC**, three decades late, and reinventing them a little worse. The moment it reaches for
+*stateful* sessions it becomes an incompetent copy of the thing it cloned: any protocol that
+pins per-session state in server memory fights a plain load balancer, and a dropped connection
+takes the model's context down with it. REST solved this in the 1990s by being stateless; MCP
+un-solved it.
+
+And the deepest problem is the oldest one. MCP deletes no complexity — it *shovels* it, off
+the agent's desk and onto whoever now maintains `Stripe-MCP-Server`, `DB-MCP-Server`,
+`K8s-MCP-Server`, forever, chasing every upstream API change. That's the ESB and the SOA
+gateway, exhumed. There are tens of thousands of APIs in the world; the plan is to wrap them
+all, by hand, and keep them current? Of course not — which is why the protocol's own vendor
+actively maintains only a handful of reference servers and the rest of the "ecosystem" is a
+landfill of weekend toys. Nobody wants to be the soul maintaining the wrapper. They never did.
+That's why CORBA is dead.
+
+## What we do instead
+
+I build **[TARS](https://github.com/leocaolab/tars)**, a Rust-first, strongly-typed agent
+runtime — and its whole thesis is the inverse of MCP's. Correctness is a type-system property,
+not a matter of discipline:
+
+- **Errors are typed values, not strings** — a real sum type (`Permanent / Retryable /
+  RateLimited / Auth`), with `retry_after` as a field, not a substring you grep out of an
+  exception.
+- **Parse, don't validate** — hand the decoder your `T`, get back a valid `T` or a typed
+  error. You can never hold an ill-formed one.
+- **The pipeline is an algebra** — telemetry → auth → budget → cache → guard → routing →
+  breaker *compose*.
+
+And where MCP exists because Claude Desktop and ChatGPT are black boxes floating *outside* your
+walls — unable to touch your database, so you cut them a hole to reach in — TARS is **embedded
+in your service**. It runs on the box that already holds the IAM role, next to the secret
+already in the environment and the connection pools already open. The model supplies intent;
+typed Rust performs the act; every call is sandboxed, budgeted, and audited. The credential
+never enters the model's context because it never had to leave the process. Wrapping that in
+MCP to reach the outside world safely is like pitching a plastic tent inside a fortress.
+
+## The verdict
+
+As core architecture, MCP is a leaky sieve with an ancestry of dead middleware and a rap sheet
+of live CVEs; keeping it out of the core isn't caution, it's hygiene. As an *outer plug* — if
+you genuinely need to be reachable from inside a closed host like Cursor or Claude Desktop — a
+throwaway MCP server adapter at the very edge costs almost nothing and earns nothing over plain
+gRPC except "the closed host already dials this number." It's a gateway converter, not an
+architectural primitive.
+
+MCP is not a technology. It's a plug that a few closed apps happen to accept. Build a great
+product *for* that ecosystem if you like — but don't let its flat, untyped bag anywhere near the
+core of a system you want to reason about.
+
+---
+
+*I'm building [TARS](https://github.com/leocaolab/tars) — an embeddable, strongly-typed
+multi-agent LLM runtime in Rust — in the open. If the type-system-first take resonates, the
+[repo](https://github.com/leocaolab/tars) is where it lives.*
