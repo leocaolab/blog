@@ -1,0 +1,11 @@
+{
+  // Names the existing Worker so `wrangler deploy` (run by Cloudflare's build on
+  // every push to main) updates it instead of stopping on the "already exists"
+  // safety check. This is a static-assets-only Worker: Astro builds to ./dist
+  // and Cloudflare serves it from the edge — no Worker script.
+  "name": "leocaolab-blog",
+  "compatibility_date": "2026-07-07",
+  "assets": {
+    "directory": "./dist"
+  }
+}
