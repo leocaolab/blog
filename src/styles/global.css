@@ -137,6 +137,47 @@ h2 {
   margin-bottom: 2rem;
 }
 
+.series-toc {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.9rem 1.1rem;
+  margin: 0 0 2rem;
+  font-size: 0.95rem;
+}
+.series-toc .series-label {
+  margin: 0 0 0.4rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.series-toc ol {
+  margin: 0;
+  padding-left: 1.3rem;
+}
+.series-toc li {
+  margin: 0.15rem 0;
+}
+.series-toc li[aria-current="true"] {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.series-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.95rem;
+}
+.series-nav .next {
+  margin-left: auto;
+  text-align: right;
+}
+
 .video {
   position: relative;
   padding-bottom: 56.25%;

@@ -14,6 +14,25 @@ const { post } = Astro.props
 const { Content } = await render(post)
 const fmt = (d: Date) =>
   d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+
+// Series navigation: gather sibling posts sharing this post's `series` slug,
+// ordered by seriesOrder. Empty unless the post declares a series.
+let seriesParts: Awaited<ReturnType<typeof getCollection>> = []
+let seriesIndex = -1
+if (post.data.series) {
+  seriesParts = (
+    await getCollection(
+      "posts",
+      ({ data }) => !data.draft && data.series === post.data.series
+    )
+  ).sort((a, b) => (a.data.seriesOrder ?? 0) - (b.data.seriesOrder ?? 0))
+  seriesIndex = seriesParts.findIndex((p) => p.id === post.id)
+}
+const prevPart = seriesIndex > 0 ? seriesParts[seriesIndex - 1] : null
+const nextPart =
+  seriesIndex >= 0 && seriesIndex < seriesParts.length - 1
+    ? seriesParts[seriesIndex + 1]
+    : null
 ---
 
 <BaseLayout
@@ -55,8 +74,50 @@ const fmt = (d: Date) =>
       )
     }
 
+    {
+      seriesParts.length > 1 && (
+        <nav class="series-toc" aria-label="Series contents">
+          <p class="series-label">
+            Series · Part {seriesIndex + 1} of {seriesParts.length}
+          </p>
+          <ol>
+            {seriesParts.map((p) => (
+              <li aria-current={p.id === post.id ? "true" : undefined}>
+                {p.id === post.id ? (
+                  <span>{p.data.title}</span>
+                ) : (
+                  <a href={`/blog/${p.id}/`}>{p.data.title}</a>
+                )}
+              </li>
+            ))}
+          </ol>
+        </nav>
+      )
+    }
+
     <div class="prose">
       <Content />
     </div>
+
+    {
+      (prevPart || nextPart) && (
+        <nav class="series-nav" aria-label="Series navigation">
+          {prevPart ? (
+            <a class="prev" href={`/blog/${prevPart.id}/`}>
+              ← {prevPart.data.title}
+            </a>
+          ) : (
+            <span />
+          )}
+          {nextPart ? (
+            <a class="next" href={`/blog/${nextPart.id}/`}>
+              {nextPart.data.title} →
+            </a>
+          ) : (
+            <span />
+          )}
+        </nav>
+      )
+    }
   </article>
 </BaseLayout>

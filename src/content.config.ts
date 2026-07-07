@@ -14,6 +14,10 @@ const posts = defineCollection({
     date: z.coerce.date(),
     updated: z.coerce.date().optional(),
     tags: z.array(z.string()).default([]),
+    // Series: group multi-part posts. `series` is a slug shared across all
+    // parts; `seriesOrder` is the 1-based part number used to order them.
+    series: z.string().optional(),
+    seriesOrder: z.number().optional(),
     ogImage: z.string().optional(),
     // YouTube video id for the companion video, if any.
     youtube: z.string().optional(),
