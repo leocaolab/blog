@@ -1,0 +1,142 @@
+---
+title: "Entering the Arena: what a 15-profile benchmark demands"
+description: "A composite HTTP benchmark doesn't score one hot path — it scores fifteen, and it forced a five-feature backlog that had to land with no regression."
+date: 2026-07-07
+tags: [benchmarks, http, performance, architecture, memory]
+series: "pyre"
+seriesOrder: 28
+draft: false
+---
+
+Most benchmark numbers you see for a web framework are one number: a plaintext `GET /`
+under `wrk`, on a good day, on the author's laptop. Pyronova had plenty of those — 420k+
+req/s on a single Linux box, and, in a separate full-stack test on macOS, landing within
+~97% of pure-Rust Axum (both frameworks around 220k req/s on that run, not the 420k figure).
+Those numbers are honest and they're also easy to over-love, because they measure the one
+path a framework is proudest of.
+
+A composite HTTP benchmark refuses to let you do that. Instead of scoring your best hot
+path, it scores a *portfolio* of them — plaintext, JSON, compressed JSON, TLS, file
+upload, static files, a database query, a small CRUD API — and adds the per-profile scores
+together. You don't win by being spectacular at one thing. You win by having no holes.
+
+That framing is the entire point of this post. Deciding to enter a 15-profile arena was
+less a marketing decision than a **feature-completeness audit that came with a scoreboard**.
+It surfaced exactly the parts of the framework that didn't exist yet.
+
+## How a composite score actually works
+
+The scoring is worth understanding because it dictates strategy. For each profile:
+
+```
+rpsScore = (framework_avg_rps / best_framework_avg_rps) × 100
+```
+
+The fastest framework on that profile gets 100; everyone else is graded on the curve
+relative to it. On top of that, each profile can earn up to **+50 for memory efficiency**,
+computed as `sqrt(rps) / memoryMB` — so a framework that hits a given throughput in a
+smaller RSS is rewarded. Sum across all 15 profiles and you get a composite. The
+theoretical ceiling is ~2250; nobody comes close, because nobody is best-in-class at
+everything at once.
+
+Two consequences fall straight out of the formula:
+
+1. **A zero hurts more than a mediocre score helps.** A profile you don't implement is a
+   0, and a 0 is unrecoverable — there's no hot path elsewhere that buys it back. Breadth
+   dominates.
+2. **Memory is graded on every profile, not once.** For a project whose entire thesis is
+   "N sub-interpreters in one process instead of N OS processes," the `sqrt(rps)/memoryMB`
+   bonus is structurally friendly — but only if the new features don't blow up RSS.
+
+The competitive landscape around the arena sets the stakes without needing any
+prediction: the top of the board is a pure-Rust framework, and the most popular Python
+framework sits near the bottom of the pack. The interesting question for a "per-core
+Python" project isn't "can we top a Rust framework at plaintext" — we're honest that we
+can't — it's "how many profiles can a Python framework be genuinely competitive on at
+once." That's a goal, not a projection; the actual head-to-head numbers came later and
+are their own story.
+
+## The five-feature backlog the arena forced
+
+Lining up the 15 profiles against what Pyronova shipped at v1.5.0, five of them mapped to
+capabilities that simply weren't in the framework yet. The backlog wrote itself:
+
+| # | Feature | Profile it unblocks | Shape of the work |
+|---|---|---|---|
+| 1 | **Async Postgres** (sqlx `PgPool`) | Async DB | Shared pool + cross-interp dispatch |
+| 2 | **CRUD REST helpers** | CRUD | Built on top of the DB layer |
+| 3 | **Response compression** (gzip / brotli) | JSON compressed | Independent, low-risk |
+| 4 | **HTTPS / TLS** via rustls | JSON over TLS | Accept-loop stream wrapping |
+| 5 | **Upload streaming** | Upload | Replace a buffered body path |
+
+None of these is exotic on its own — every mature framework has them. The point is that a
+composite benchmark doesn't let you *skip* the ones you happen not to have gotten to yet.
+Each missing feature is a guaranteed 0, and five 0s out of fifteen is not a competitor,
+it's a no-show.
+
+A couple of them carried real design weight. Async Postgres is the one this series spends
+the next few posts on, because a naive port force-serializes every query through a single
+GIL and quietly caps the DB profile at a few thousand req/s — the sub-interpreter
+architecture makes the *wrong* way genuinely tempting. Upload streaming was the highest-
+friction item because it changes the Python-facing API: a buffered `collect()` of the
+whole body becomes an `async for chunk in req.stream()`, which ripples into how the
+request lifecycle is structured. TLS, compression, and CRUD were more mechanical, but each
+adds a branch to the hot path that must cost nothing when it's off.
+
+> **Pyronova is open source.** If a Python framework trying to have no holes across fifteen
+> profiles interests you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The real constraint: land all five with no regression
+
+Here's the part that's easy to underestimate. Adding five features to a framework is
+ordinary work. Adding five features to a framework whose *entire identity* is a
+carefully-tuned hot path — without moving the hot path — is the actual engineering.
+
+Every one of these features introduces machinery that lives right next to the request
+loop: a compression enable/disable branch, a TLS stream-type enum wrapping every accepted
+connection, a streaming-flag lookup, a whole DB module with its own runtime. If any of
+that leaks a few hundred nanoseconds into the plaintext path, the thing that made the
+project worth writing about is gone. So the rule was: **compiled in, but free when off.**
+
+After all five landed, I ran a full regression audit against the v1.5.0 baseline on the
+same 8-core machine used for every prior benchmark. The headline numbers had to hold, and
+they did:
+
+| Metric | v1.5.0 baseline | Post-v1.6 | Delta |
+|---|---|---|---|
+| Plaintext `GET /` | 423k rps | **430k rps** | **+1.7%** |
+| Pipelined (depth 16) | 902k rps | **921k rps** | **+2.2%** |
+| RSS growth, plain JSON (9M reqs) | 0.06 B/req | **0.12 B/req** | noise-level |
+| RSS growth, TLS + brotli (2.7M reqs) | — | **3.1 B/req** | new; 60× under gate |
+| Memory regression suite | 9/9 | **9/9** | unchanged |
+| `cargo test` | 42/42 | **42/42** | unchanged |
+
+Both throughput numbers came out *above* the pre-feature baseline — not because the new
+code is faster, but because it's genuinely inert when unused, and the delta is inside
+day-to-day machine variance. The "compiled-in-but-disabled" pattern did its job: the plain
+connection takes the `Plain` variant of the TLS enum with zero TLS code executed, the
+compression path is one relaxed atomic load and a branch-not-taken, the DB module is dormant
+until `PgPool.connect()` is first called.
+
+The memory story is the one I care about most, because it's the whole thesis. On the plain
+sustained path, RSS growth is 0.12 B/req — effectively at the allocator-noise floor (the
+0.06 → 0.12 move is mimalloc arena drift, not a leak). Even under the heaviest stack, TLS
+plus brotli both on, growth is 3.1 B/req: that's transient encoder-buffer pressure at
+steady state, and it sits **60× under** the 200 B/req regression gate. Five features, and
+the memory profile that justifies "sub-interpreters instead of processes" is untouched.
+
+## The point of a portfolio
+
+It would have been more comfortable to keep publishing the one plaintext number. Entering
+a composite benchmark is a deliberate choice to be graded on your weaknesses as much as
+your strengths — the profile you never implemented, the memory you regressed, the feature
+you bolted on and quietly slowed the hot path with.
+
+That's also exactly why it was worth doing. The five-feature backlog wasn't arena-specific
+busywork; it was the set of things a real web framework needs and this one didn't have yet.
+The scoreboard just made the gaps impossible to ignore, and the no-regression bar made sure
+closing them didn't cost the thing the project was built to prove. The next few posts go
+deep on the hardest of the five — async Postgres across sub-interpreters — where the
+obvious implementation is a trap, and breaking out of it meant reaching for the raw C-API
+again.

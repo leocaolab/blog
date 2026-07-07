@@ -1,0 +1,162 @@
+---
+title: "24-28× FastAPI (and why the GIL, not Python, is the villain)"
+description: "A head-to-head that shows 23.8–28.4× the throughput and 29–34× lower latency than FastAPI — plus the honest worker-count caveat that makes the number mean something."
+date: 2026-07-07
+tags: [python, gil, sub-interpreters, benchmarks, performance, http]
+series: "pyre"
+seriesOrder: 20
+draft: false
+---
+
+Let me give you the punchline and the catch in the same breath, because the
+catch is the point.
+
+On I/O-bound API routes, Pyronova measured **23.8–28.4× the throughput** and
+**29–34× lower latency** than FastAPI. And that comparison is FastAPI running a
+**single** Uvicorn worker against Pyronova running **10** sub-interpreters. If
+that asymmetry makes you want to close the tab — good. Stay, because the reason
+we ran it that way, and what it does and doesn't prove, is the whole story of
+why Python web performance has been stuck.
+
+## The numbers
+
+Machine: Apple M4 Pro, 10 cores, 16 GB RAM. Python 3.14.3 (per-interpreter GIL).
+Pyronova v1.2.0 (mimalloc, sub-interpreter mode, 10 workers). FastAPI 0.135.2 +
+Uvicorn 0.42.0 (single worker). Load: wrk, 4 threads, 100 connections, 10s per
+test.
+
+| Test | FastAPI | Pyronova | Speedup |
+|------|---------|----------|---------|
+| Health Check (plain JSON) | 9,031 req/s | 214,714 req/s | **23.8×** |
+| JSON Echo (parse + serialize) | 7,602 req/s | 209,012 req/s | **27.5×** |
+| Validation (field checking) | 7,345 req/s | 208,439 req/s | **28.4×** |
+| CPU-bound (moving avg, 10k points) | 263 req/s | 599 req/s | **2.3×** |
+
+Latency tells the same story from the other side:
+
+| Test | FastAPI | Pyronova | Reduction |
+|------|---------|----------|-----------|
+| Health Check | 11.10 ms | 0.38 ms | **29× lower** |
+| JSON Echo | 13.17 ms | 0.40 ms | **33× lower** |
+| Validation | 13.75 ms | 0.41 ms | **34× lower** |
+| CPU-bound | 374.42 ms | 165.36 ms | **2.3× lower** |
+
+Two of these rows behave completely differently, and the gap between them is the
+whole argument.
+
+## The honest caveat, up front
+
+The obvious objection: *you compared 10 workers to 1. Run `uvicorn --workers 10`
+and the gap vanishes.*
+
+Partly true, and worth taking seriously rather than burying. Running
+`uvicorn --workers 4` would give FastAPI roughly 4× via multiprocessing — an
+estimated ~36k req/s on the Health Check, which would narrow the gap from 24×
+to something like 6×. That's an extrapolation, not a measurement — we didn't run
+the multi-worker config — but it's directionally fair. And it isn't free; the
+"just add workers" reflex hides what you're actually buying:
+
+- **Each worker is a full Python process.** Memory multiplies per worker — you
+  pay for the whole interpreter, N times.
+- **No shared state between workers.** Anything cross-request — a cache, a
+  counter, a connection pool — now needs Redis or the database to coordinate.
+- **Each worker is still single-GIL inside.** You didn't fix the GIL; you just
+  bought more copies of it in separate address spaces.
+
+So even the fairest multiprocess comparison would put FastAPI at an estimated
+~36k against Pyronova's measured ~210k — in a **single process, with shared
+memory, zero config**.
+The 24× headline is a single-worker-vs-10-worker number; the honest, apples-ish
+number after you let FastAPI use multiprocessing is still several-fold, and it
+comes with process bloat and no shared state attached. Both of those are true at
+once, and you should hold both.
+
+> **Pyronova is open source.** If giving Python one GIL per core instead of one
+> per process sounds worth a look, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Why the CPU-bound row is only 2.3×
+
+Notice that the I/O routes are 24–28× but the CPU-bound moving-average route is
+only 2.3×. That contrast is the most honest thing in the whole benchmark, and it
+tells you exactly where the speedup comes from.
+
+The moving average is pure Python — a real computation that takes ~165 ms per
+request no matter what. Pyronova runs 10 of them at once across 10 interpreters,
+so throughput scales; but each *individual* request still takes ~165 ms, so
+per-request latency only improves by the parallelism factor, not more.
+Parallelism helps throughput, not the cost of one computation.
+
+On the I/O routes, there's almost no per-request work — the handler waits, or
+parses a tiny JSON body, and returns. There, FastAPI's bottleneck isn't compute,
+it's the GIL serializing 100 concurrent connections into a single-file line.
+Remove that serialization and you don't get 2.3×, you get 24×. **The size of the
+speedup is a direct readout of how much the GIL was the bottleneck.** Where
+Python was genuinely doing the work (CPU-bound), the gap is modest. Where the
+GIL was just making requests wait in line (I/O-bound), the gap is enormous.
+
+That's the thesis in one benchmark: **it's the GIL, not Python, that's slow.**
+
+## What actually changed: multiply the GIL
+
+FastAPI is architecturally single-threaded. `async`/`await` gives you
+*concurrency* — one core juggling many waiting requests — but never
+*parallelism*, because one GIL means one thread executing Python bytecode at a
+time. Under 100 concurrent connections, FastAPI saturates one core and queues
+the rest behind the lock. Uvicorn and uvloop are excellent; they're just
+excellent at feeding a single-lane bottleneck.
+
+Pyronova's bet is PEP 684: N sub-interpreters in one process, each with its own
+independent GIL. Ten interpreters, ten GILs, ten cores actually running Python
+in parallel. No `multiprocessing` (which multiplies memory and severs shared
+state), no free-threading (which pays a refcount tax on every object). The GIL
+isn't removed — it's replicated, once per core, inside a single address space.
+
+| | FastAPI (traditional) | Pyronova (sub-interp) |
+|---|---|---|
+| Server | Uvicorn (uvloop) | Hyper (Rust + Tokio) |
+| Concurrency | async/await, single core | 10 sub-interpreters, all cores |
+| Memory model | One interpreter, shared GIL | Per-interpreter GIL (PEP 684) |
+
+## The cost, stated plainly
+
+The per-interpreter GIL isn't free either. Memory:
+
+| Framework | RSS |
+|-----------|-----|
+| FastAPI | 35.7 MB |
+| Pyronova | 60.8 MB |
+
+Pyronova uses more absolute RAM — 10 sub-interpreters at ~6 MB each. But that's
+10 cores' worth of parallelism in 60.8 MB, versus 35.7 MB for one core.
+*Per-core*, Pyronova's memory is lower — and unlike `uvicorn --workers 10`, it's
+one process with shared memory, not ten copies.
+
+There's a second cost the benchmark doesn't show: the ecosystem. Sub-interpreters
+can't load C extensions that assume a single global interpreter — Pydantic V2
+(its core is compiled Rust), NumPy, Pandas will crash or misbehave. The
+sub-interpreter path wants pure-Python or Rust-native libraries: `msgspec`
+instead of Pydantic, Polars instead of Pandas, `httpx`, stdlib `json`. That's a
+real migration, and for a numpy-heavy analytics route you keep a `gil=True`
+escape hatch that runs on the main interpreter with the full ecosystem. The 24×
+number lives on the sub-interpreter path with sub-interpreter-safe libraries —
+it is not a free lunch you get by pointing Pyronova at your existing Pydantic
+app.
+
+## The honest scoreboard
+
+Put together, here's what this benchmark does and doesn't claim:
+
+- On I/O-bound routes — the majority of real web services — Pyronova delivered
+  24–28× the throughput and 29–34× lower latency than **single-worker** FastAPI.
+- Against multiprocess FastAPI (`--workers N`), the gap shrinks to several-fold,
+  and FastAPI pays for it with per-worker memory and lost shared state.
+- On genuinely CPU-bound Python, the gap is 2.3× — because there Python really
+  is doing the work, and no architecture makes a 165 ms computation cheap.
+- The win costs more absolute RAM and a migration to sub-interpreter-safe
+  libraries.
+
+Every one of those is true, and the headline only means something because the
+caveats are printed next to it. The GIL, not Python, is the villain — and when
+you give Python one GIL per core instead of one GIL per process, its web
+performance walks into a different league.

@@ -1,0 +1,142 @@
+---
+title: "The bet: don't remove the GIL — multiply it"
+description: "PEP 684 gives every sub-interpreter its own GIL. The founding bet behind Pyronova was to run N of them in one process — and to go raw against the CPython C-API to do it."
+date: 2026-07-07
+tags: [python, gil, sub-interpreters, rust, pyo3, architecture]
+series: "pyre"
+seriesOrder: 3
+draft: false
+---
+
+There's a reflex, when you hit the GIL, to try to *remove* it. That's the whole framing of
+the no-GIL effort: the lock is the problem, so delete the lock. It's a reasonable instinct
+and, as I've written earlier in this series, it comes with a real bill — atomic refcounting
+makes single-threaded Python slower, and a huge amount of compiled-extension code isn't safe
+without the lock it was written to assume.
+
+Pyronova is built on the opposite bet. Don't remove the GIL. **Multiply it.** Run N
+independent Python interpreters in one process, each with its own GIL, and let them run
+Python bytecode on N cores at the same time. The lock stays exactly as safe as it always
+was — there are just N of them now, one per interpreter, and they don't contend.
+
+## Why this is even possible: PEP 684
+
+The mechanism is **PEP 684 — A Per-Interpreter GIL**, shipped in Python 3.12: sub-interpreters
+had existed for decades but always shared one GIL, so they could isolate state and never run
+Python in parallel — 684 gave each its own, and that one change is what turns a curiosity into
+an architecture. (Post 04 tells the fuller origin story.)
+
+The property that makes it work for a server is isolation. Each sub-interpreter has its own:
+
+- module imports and module state
+- built-in types and singletons
+- exception state
+- thread state (`PyThreadState`)
+- reference-count bookkeeping
+- and, since 3.12, its own GIL
+
+So the architecture practically designs itself. Boot the process, create one sub-interpreter
+per core, load the application code independently into each, and route each incoming HTTP
+request to an interpreter over a lock-free channel. The handler runs in that interpreter, in
+parallel with handlers in the others. That's genuinely different from `gunicorn -w N`
+(N whole processes) and from a threaded server (one GIL, one bottleneck): one process, one
+set of file descriptors, one set of metrics — but N cores' worth of parallel Python.
+
+And because it's one process, the things that multiprocessing makes expensive get cheap
+again. Memory isn't duplicated N times — there's one binary, one OS resource set, and the
+per-interpreter overhead is just the interpreter's own arena. There's no IPC, because the
+workers live in the same address space; cross-worker state can live on the Rust side of the
+process instead of in Redis.
+
+## Where the trade actually lands
+
+This is where I have to be honest, because the sub-interpreter bet isn't free — no GIL
+workaround is. Two of the four sub-interpreter properties are gifts and two are bills.
+
+The gifts are **isolation** and **memory safety**: a buggy handler that corrupts module
+state in one worker can't touch another, GC runs per-interpreter on its own schedule, and a
+leak is bounded to one interpreter's arena so you can recycle that worker without restarting
+the process.
+
+The bill is **C-extension compatibility**. Objects are not shared across interpreters, and
+older compiled extensions built with process-global state — a single `static PyObject*`
+module state in C — become a process-wide bug the moment they load into two interpreters.
+This is the same wall free-threading runs into; it's a CPython-ecosystem limitation, not a
+framework choice. Pyronova's answer is a fallback: routes that need a legacy C extension are
+marked `gil=True` and dispatched to the main interpreter, which still holds the classic GIL,
+while everything else runs in parallel across the sub-interpreters. You lose parallelism on
+those specific routes and keep it everywhere else.
+
+> **Pyronova is open source** — this whole bet, multiplied GILs over a raw C-API
+> bridge, as a server you can run. ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## PyO3 said no
+
+Here's the part that made this a project instead of a weekend prototype. When Pyronova
+reached the "true parallelism" phase, there were two candidate modes on the table:
+
+- **Mode A — free-threaded Python** (`python3.14t`, no-GIL). PyO3 already supported it;
+  minimal changes; all the Tokio worker threads share one interpreter and call handlers
+  truly in parallel. Easy.
+- **Mode B — per-interpreter GIL.** Each worker thread binds its own independent
+  sub-interpreter with its own GIL. Process-level isolation *and* thread-level performance.
+
+Mode B is the one worth having. The problem is that **PyO3 refuses sub-interpreters** — and
+PyO3 is *the* Rust↔Python binding, the thing you'd reach for by default. PyO3 0.28 actively
+blocks it: `#[pymodule]` checks the interpreter ID, and the second time you try to import
+into a new interpreter it raises `ImportError`. The underlying reason is sound — PyO3 keeps a
+lot of global `static` state internally, and sharing that across interpreters would be
+genuinely unsound — but the practical effect is a locked door.
+
+The decision was **not** to fork PyO3, but to go around it: drop to raw `pyo3::ffi` and call
+the CPython C-API directly inside each sub-interpreter.
+
+- `Py_NewInterpreterFromConfig` with `PyInterpreterConfig_OWN_GIL` to create an
+  independent-GIL sub-interpreter
+- `PyRun_String` to execute the user's script (with framework code filtered out)
+- `PyDict_GetItemString` to pull the handler function object out
+- `PyObject_Call` to invoke the handler directly
+- plain-Python `_Request` / `_Response` objects in place of PyO3's `#[pyclass]`, which can't
+  cross into a sub-interpreter
+
+The honest cost of that path: raw pointers, manual reference counting, no RAII, no
+safety net. You are hand-managing `Py_INCREF` / `Py_DECREF` and living with bare
+`*mut ffi::PyObject`. It is exactly as sharp as it sounds, and hardening it — RAII wrappers
+that DECREF on drop, a proper worker pool, cleaning up interpreters on shutdown — became a
+big chunk of the work that followed. But it's what let the sub-interpreter mode exist at all.
+
+## Did the bet pay off?
+
+Enough to keep going. The very first skeleton — Tokio + Hyper, a PyO3 bridge, GIL
+detach/attach — already did 69k req/s against Robyn's 27k, about 2.5×, in 10 MB of RSS
+versus 35 MB. Once the sub-interpreter pool landed, the multi-core version reached 216k
+req/s while Robyn sat at 76k, roughly 2.8×. And that early sub-interpreter path benchmarked at
+about **97% of pure Rust** — meaning the Python dispatch layer was thin enough that you were
+paying only a few percent over a hand-written Rust server for the privilege of running actual
+Python handlers.
+
+The headline comparison, from the **v1.4.0** best-of-run on an 8-core/16-thread Linux box
+(AMD Ryzen 7 7840HS) — Pyronova with 16 sub-interpreter workers, Robyn given every advantage
+at `--processes 16 --workers 2` (32 workers) — looks like this:
+
+| | Architecture | Throughput (GET /) | Memory |
+|---|---|---|---|
+| Pyronova | 1 process, 16 sub-interpreters | 429k req/s (v1.4.0) | 189 MB |
+| Robyn | 16 processes × 2 workers | 156k req/s | 583 MB |
+
+Same hardware — about 2.7× the throughput on roughly one-third of the memory. (Later releases
+report the plaintext baseline slightly differently as the harness tightened — post 04 quotes
+422,976 req/s at v1.5.0 on the same machine — but the shape of the win holds.) The Python
+underneath is the same CPython, so it isn't that the Python is faster. Part of the gap is the
+shared-memory architecture — sixteen GILs in one process instead of sixteen GILs across
+sixteen duplicated ones, with cross-worker state on the Rust side instead of over IPC — but
+it isn't only the GILs. The Rust stack under Pyronova is doing real work too: Hyper rather
+than actix-web, Rust `serde_json` instead of Python's `json`, mimalloc, SO_REUSEPORT accept
+spread across the interpreters, fat LTO, and lock-free crossbeam channels all compound into
+the number.
+
+That's the whole bet. The GIL was never really the enemy — the *single* GIL was. So don't
+fight the lock, and don't pay to remove it. Make more of them, give each its own core, and
+keep them in one cheap process. The rest of this series is what it took to actually make
+that stand up in production.

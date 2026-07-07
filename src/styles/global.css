@@ -164,6 +164,17 @@ h2 {
   font-weight: 600;
 }
 
+.series-count {
+  display: inline-block;
+  font-size: 0.75rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  padding: 0.05rem 0.45rem;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+
 .series-nav {
   display: flex;
   justify-content: space-between;

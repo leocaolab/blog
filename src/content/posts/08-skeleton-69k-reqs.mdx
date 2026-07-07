@@ -1,0 +1,170 @@
+---
+title: "Skeleton: 69k req/s and 2.5× Robyn on day one"
+description: "The first Tokio + Hyper + PyO3 + matchit skeleton, and why a lean HTTP stack plus a minimal GIL hold beat a mature Rust-backed framework before we optimized anything."
+date: 2026-07-07
+tags: [python, rust, performance, gil, http, benchmarks]
+series: "pyre"
+seriesOrder: 8
+draft: false
+---
+
+The bet behind Pyronova is that you can have C++-class throughput and Python's
+ecosystem in the same process — by running N CPython sub-interpreters, each with
+its own GIL (PEP 684), for true multi-core Python. That's the destination. But
+before any of that, you need a skeleton: something that accepts a TCP connection,
+parses HTTP, routes it, calls a Python function, and writes a response.
+
+So the first milestone was deliberately unambitious. **One** Tokio runtime,
+**one** GIL, no sub-interpreters, no free-threading, no clever tricks. Just the
+leanest possible path from socket to Python and back:
+
+```
+Tokio + Hyper + PyO3 0.28 + matchit
+```
+
+Tokio for the async runtime, Hyper for the HTTP layer, PyO3 0.28 as the CPython
+bridge, and `matchit` for routing. That's the whole thing. The interesting part
+is that this stripped-down skeleton — a single-core, single-GIL server with zero
+optimization work behind it — already beat Robyn, a Rust-backed Python framework,
+by 2.5×.
+
+Here's what day one looked like.
+
+## The numbers
+
+Test environment: macOS ARM64, Python 3.14, Rust 1.93.1, load generated with
+`wrk -t4 -c256 -d10s`.
+
+| Test Scenario | Pyronova | Robyn 0.82 | Multiplier |
+|----------|----------------|------------|------|
+| GET / (plain text) | 69,032 req/s | 27,431 req/s | 2.52× |
+| GET / avg latency | 3.73ms | 10.31ms | 2.76× |
+| GET /hello/bench (JSON) | 64,093 req/s | 29,113 req/s | 2.20× |
+| GET /hello/bench avg latency | 4.08ms | 9.27ms | 2.27× |
+
+Both frameworks are "Rust under Python." Robyn wraps Actix-web; Pyronova wraps
+Hyper. Both call into the same CPython. So where does a 2.5× gap come from before
+you've even started optimizing? Three places.
+
+## Reason 1: a lighter HTTP stack
+
+Robyn is built on Actix-web — a feature-complete, batteries-included framework.
+Pyronova is built on Hyper, which is close to bare metal: it parses HTTP and
+hands you a request, and that's it.
+
+The difference shows up on startup. Robyn automatically registers extra routes:
+
+```
+Added route GET /openapi.json
+Added route GET /docs
+Docs hosted at http://127.0.0.1:8001/docs
+```
+
+OpenAPI, docs endpoints, a logging middleware chain — every request pays a small
+toll to pass through all of it. None of that is *wrong*; it's a reasonable set of
+defaults for a general framework. But it's overhead, and it's on the hot path.
+The skeleton had none of it: a request comes in, matches a route, calls the
+handler, returns. Nothing in between.
+
+## Reason 2: the GIL is held for microseconds, not milliseconds
+
+This is the one that matters most, and it's the pattern the whole project is
+built around.
+
+Robyn routes every request — even a trivial one — through Python's async
+machinery: coroutine creation, event-loop scheduling, and repeated GIL
+acquire/release cycles. That's a lot of GIL churn for a handler that returns a
+string.
+
+Pyronova's skeleton runs the **entire** event loop outside the GIL, and only
+grabs it for the microseconds it takes to actually call the Python handler:
+
+```rust
+// The entire event loop runs outside the GIL
+py.detach(move || {
+    rt.block_on(async { /* Tokio loop */ })
+});
+
+// The GIL is acquired only at the moment of calling the Python handler
+Python::attach(|py| {
+    handler.call1(py, args)  // acquire GIL -> call -> release
+});
+```
+
+Route matching, HTTP parsing, TCP I/O — all of it happens in the Rust layer,
+completely outside the GIL. The GIL hold time is compressed to the smallest
+possible granularity: the few microseconds the Python handler runs. Everything
+else is Rust.
+
+That principle — *hold the GIL for as little as physically possible* — is what
+later makes the sub-interpreter design pay off. But even with a single GIL on a
+single core, minimizing the hold window is most of the win here.
+
+> **Pyronova is open source.** If a lean socket-to-Python path is your kind of thing, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Reason 3: faster routing
+
+| | Pyronova | Robyn |
+|--|----------|-------|
+| Routing engine | matchit (radix trie, compile-time optimized) | Actix built-in router |
+| Complexity | O(path length), zero allocations | general-purpose, heavier |
+
+`matchit` is a compressed-prefix-tree router — one of the fastest in the Rust
+ecosystem — and it matches a path with essentially zero heap allocations. On a
+workload where the handler itself does almost nothing, routing cost is a real
+fraction of the request, and shaving allocations here shows up in the tail
+latency.
+
+Put the three together and the request lifecycles look like this:
+
+```
+Robyn:
+  TCP -> Actix parse -> middleware chain -> Python async scheduling -> GIL
+  -> coroutine creation -> handler -> coroutine completion -> GIL release
+  -> middleware return -> response
+
+Pyronova:
+  TCP -> Hyper parse -> matchit route -> GIL -> handler -> GIL release -> response
+```
+
+Pyronova just does less per request.
+
+## The memory story
+
+Method: start the server, record idle RSS, sample every 0.5s during the
+`wrk -t4 -c256 -d10s` load test, record peak and post-test RSS.
+
+| Metric | Pyronova | Robyn 0.82 | Comparison |
+|------|----------------|------------|------|
+| Idle RSS | 10 MB | 35 MB | 3.5× less |
+| Peak RSS (256 concurrent) | 17 MB | 46 MB | 2.7× less |
+| Post-test RSS | 16 MB | 40 MB | 2.5× less |
+
+Pyronova idles at 10 MB and grows to 17 MB under full 256-connection load. Robyn
+starts at 35 MB before serving a single request — Python dependencies plus
+Actix plus OpenAPI and the rest. This isn't just an aesthetic win: a smaller
+resident set means better CPU cache behavior, which feeds back into the latency
+numbers above. Less memory *is* more speed here.
+
+## What this proves (and what it doesn't)
+
+Be honest about the scope. This is a plaintext / trivial-JSON benchmark on
+loopback. The handlers do almost nothing, so what's really being measured is the
+**framework overhead per request** — how much machinery sits between the socket
+and your code. That's exactly the thing a lean stack wins, and it's a legitimate
+result: for a lot of real endpoints, the per-request framework tax is a large
+share of the cost.
+
+What it does *not* prove is multi-core scaling. This skeleton is still one GIL on
+one core. Robyn's `--fast` multi-process mode isn't in this comparison yet, and a
+heavier handler that spends real time in Python would narrow every gap. Those are
+later posts.
+
+But the skeleton established the thesis that the rest of Pyronova is built on: if
+you keep the Rust HTTP layer thin and hold the GIL for microseconds instead of
+milliseconds, Python's per-request overhead can be made small. Small enough that,
+even single-core, you're 2.5× ahead of a mature Rust-backed competitor on day
+one — with a 10 MB footprint and not a single optimization written yet.
+
+The obvious next question: what happens when we stop sharing one GIL across every
+request? That's where it gets interesting.

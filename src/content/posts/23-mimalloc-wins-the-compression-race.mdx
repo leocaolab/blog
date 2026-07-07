@@ -1,0 +1,151 @@
+---
+title: "mimalloc wins the compression race"
+description: "A Python server beats a tuned Actix-web on compressed JSON by 1.2–1.6× — and by 35–46× against Actix's defaults. The real driver is the allocator, and the honest caveat matters."
+date: 2026-07-07
+tags: [rust, performance, benchmarks, memory, http, python]
+series: "pyre"
+seriesOrder: 23
+draft: false
+---
+
+Here is a benchmark result that looks like a lie: a Python web server serving
+compressed JSON at up to **46× the throughput of Actix-web**, the fast, popular,
+pure-Rust framework. Python beating Rust by that margin should set off every
+alarm you have. It set off mine. So this post is as much about *why the number is
+mostly not real* as it is about the part that is — because the honest slice, once
+you strip the misleading part away, is still a genuine 1.2–1.6× win, and it comes
+from a place worth understanding: the memory allocator.
+
+## The setup
+
+- **Machine:** AMD Ryzen 7 7840HS (8C/16T), with significant background load.
+  All runs back-to-back within minutes, so relative
+  numbers are apples-to-apples even though absolute rps is ~30% below this chip's
+  best recorded figure.
+- **Workload:** `GET /json-fortunes` → a 32-record fortunes-shaped payload, ~3 KB
+  uncompressed, ~1.25 KB after brotli.
+- **Client:** `wrk -t4 -c100 -d10s`, run with and without `Accept-Encoding`.
+
+Pyronova ran brotli at quality 4, gzip at level 6, compression off the async
+runtime via `tokio::task::spawn_blocking`. Actix was measured twice: once with
+its default `Compress::default()` middleware, once hand-tuned to match
+Pyronova's config.
+
+## The numbers
+
+| | Pyronova | Actix default | Actix tuned | |
+|---|---|---|---|---|
+| **brotli** req/s | **87,263** | 2,460 | 55,660 | 1.57× tuned, 35× default |
+| **gzip** req/s | **112,134** | 2,437 | 92,745 | 1.21× tuned, 46× default |
+| **no compression** req/s | 272,501 | 396,573 | **389,888** | **Actix 1.43×** |
+
+Read the bottom row first, because it's the one that keeps the rest honest. On
+*uncompressed* responses Actix wins by 1.43×. That's the real Rust-vs-Python gap:
+Pyronova pays for a Python handler call plus sub-interpreter dispatch —
+~150–200 ns per request in GIL/tstate transitions — that a pure-Rust framework
+simply doesn't have. No amount of cleverness erases that on a path where Python
+is in the loop. So the compressed-JSON win is not "Python is faster than Rust."
+Something specific is happening in the compression path.
+
+## Why the defaults are 35–46× slower (and why that's not the story)
+
+Two compounding factors, neither of which is about language:
+
+**1. Actix's default brotli quality is 11 — maximum compression.** actix-http's
+`Compress` middleware maps `ContentEncoding::Brotli` to
+`async_compression::Level::Default`, which for brotli means quality 11, the
+slowest setting: ~10–30 ms to compress a 3 KB payload on this box. No production
+service should run q=11 on a request hot path. Pyronova defaults to q=4 — the
+same sweet spot nginx, Fastify, and Cloudflare all land near.
+
+**2. The default middleware blocks the async worker.** actix-web 4's `Compress`
+runs synchronously on the request path. At concurrency 100 across 4 workers, one
+slow compression stalls the ~25 requests queued behind it on that worker. That's
+the 40 ms p99 and the 2.5k-rps plateau: head-of-line blocking, not raw
+compression speed. Pyronova runs compression on `spawn_blocking`, which has 512
+threads by default, so a hundred concurrent compressions run in parallel and the
+serving loop never stalls.
+
+Both of those are "defaults someone would actually ship," not straw men. But
+they're config, not architecture — and that's precisely why the 35–46× figure is
+**not defensible** as a framework comparison. An experienced Actix user never
+ships q=11 on a sync middleware. Quote that number and you're comparing against a
+misconfiguration.
+
+## The part that survives: 1.2–1.6× vs tuned Actix
+
+Now the interesting question. Actix *tuned* uses the same crates (`brotli` 7.x,
+`flate2` 1.x), the same quality (br=4, gzip=6), the same off-runtime pattern
+(`web::block`, which is `spawn_blocking` underneath). The CPU work per compress
+call is byte-for-byte identical. And Pyronova still wins by ~57% on brotli and
+~21% on gzip. Where does that come from, if not the compression itself?
+
+### mimalloc — the biggest factor
+
+Pyronova sets `#[global_allocator] = mimalloc::MiMalloc`. The Rust baseline sets
+no global allocator, so it uses glibc malloc.
+
+Brotli at q=4 allocates a lot of small temporary buffers during compression. At
+~100k compressions per second, glibc's arena locks become a real contention
+point across worker threads. mimalloc's thread-local heaps make that contention
+disappear. This isn't a Pyronova-specific effect — redis, clickhouse, and Rust
+crates like `snmalloc-rs` all report mimalloc running 15–25% faster than glibc
+malloc on concurrent-allocation-heavy workloads.
+
+The evidence that it's really the allocator, and not something else, is in the
+gap sizes: **gzip's gap is 1.21×, brotli's is 1.57×.** Gzip L=6 compresses the
+same 3 KB in ~50 µs versus brotli's ~150 µs, so it allocates less and spends less
+time in malloc. If the win came from, say, response-builder overhead, gzip and
+brotli would show similar ratios. They don't — the heavier allocator user shows
+the bigger gap. That points at allocator contention as the most likely driver —
+though we never A/B-toggled the allocator on and off to prove it in isolation,
+so read this as the best-supported explanation, not a controlled result.
+
+### A thinner response path
+
+The rest is plumbing. Pyronova's compressed-response path is roughly one
+`HeaderMap::insert` plus a couple of clones shorter than Actix's
+`ResponseBuilder → HeaderMap::insert × N` chain. At ~10 µs saved on a ~100 µs
+request that's another ~5%, and it stacks on top of the allocator win. Notably,
+the fix on Actix's side is not exotic: add `mimalloc` as its global allocator and
+it would likely recover most of the brotli gap. That's the honest framing — this
+is an allocator and response-path result, not a "Python beats Rust" result.
+
+> **Pyronova is open source.** If a well-chosen allocator and compression kept off
+> the request thread is your kind of detail, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The honesty box
+
+Since the eye-catching number is the misleading one, it's worth being blunt about
+what does and doesn't hold up:
+
+**✓ Defensible:**
+
+- Pyronova is ~1.5× faster than a *tuned* actix-web 4 on compressed JSON. Out of
+  the box it's 35–46× faster because Actix ships brotli q=11 and a synchronous
+  compression middleware.
+- The win over tuned Actix comes from mimalloc (concurrent allocator contention)
+  and a slightly thinner response path.
+- On uncompressed responses Actix is ~1.4× faster — the Rust-vs-Python dispatch
+  gap is real and we don't pretend otherwise.
+
+**✗ Not defensible:**
+
+- "Pyronova is the fastest framework." It isn't — Actix wins plaintext,
+  uncompressed JSON, and short-lived connections.
+- "Pyronova beats Actix by 35×." Only against Actix's bad defaults. An
+  experienced Actix user never ships that config.
+
+And to keep even the good number grounded, here's an honest extrapolation to 64
+cores, using a conservative 0.5 NUMA discount rather than a flattering 0.7:
+Pyronova brotli ≈ 87k × 8 × 0.5 ≈ 350k rps; tuned Actix ≈ 55k × 8 × 0.5 ≈
+220k rps. That's a ~1.5× advantage — not 2–3×, and certainly not 40×.
+
+The takeaway isn't "Python won the compression race." It's that the allocator was
+running the race the whole time, and most people never look at it. Set a good
+global allocator, run compression off the request thread at a sane quality, and a
+Python server can hold its own against tuned Rust on a CPU-bound response path.
+The 46× headline is a story about someone else's defaults. The 1.5× is most
+likely the allocator's story — the evidence points there, even though we never
+toggled mimalloc off to be certain.

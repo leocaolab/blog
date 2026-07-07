@@ -1,0 +1,139 @@
+---
+title: "When sharding collapsed on 64 cores"
+description: "A P2C + per-worker-queue dispatcher that scaled beautifully on an 8-core laptop would spend most of its budget on cross-die atomic traffic on a 64-core NUMA box. The design-time analysis that forced a rethink."
+date: 2026-07-07
+tags: [rust, performance, architecture, benchmarks, linux, sub-interpreters]
+series: "pyre"
+seriesOrder: 33
+draft: false
+---
+
+There's a specific kind of humbling where your best optimization is poised to
+become your worst bottleneck the moment you scale to a bigger machine. Not a
+regression from a bad change — a regression latent in *hardware you were trying to
+exploit*. This is that story: a work dispatcher that scaled cleanly to 8 cores,
+and the design-time analysis showing it would sink most of its time budget into
+inter-die memory traffic the moment it met 64.
+
+A note on what this post is and isn't: the development machine was 8 cores. The
+64-core collapse below was reasoned out against the target NUMA topology — it is
+design-time analysis of what P2C sharding *would* do on that hardware, not a
+profiled run on a Threadripper. That reasoning is exactly what motivated the
+re-architecture; I'm flagging it as reasoning, not as a benchmark.
+
+## The dispatcher that worked
+
+Pyronova runs N CPython sub-interpreters in one process, one per core, and
+dispatches incoming requests to them. Early on, that dispatch went through
+tokio's multi-threaded, work-stealing runtime with a shared worker pool. Under
+load, a single shared work queue is a contention magnet — every worker hammering
+the same MPMC (multi-producer, multi-consumer) endpoint — so we built the
+standard mitigation, a sharding trio:
+
+- **Per-worker queues.** Each worker gets its own bounded channel instead of one
+  shared queue, so producers don't all serialize on the same tail.
+- **Power of Two Choices (P2C).** For each incoming request, probe two random
+  workers and hand the task to the less-busy one. It's a well-known result that
+  two random probes get you close to optimal load balancing at a fraction of the
+  coordination cost of checking all N.
+- **A busy flag.** Each worker exposes an atomic "am I busy" bit so the P2C probe
+  can read load without taking a lock.
+
+On the development machine — a Ryzen 7 7840HS, 8 cores, a single unified memory
+domain (UMA) — this was excellent. The atomics were cheap, the load spread
+evenly, throughput scaled. It shipped, and it was the right design for that
+machine.
+
+## The analysis that broke it
+
+Then came the target: a 64-core box, an AMD Threadripper 3995WX. Sixty-four cores, but
+not sixty-four *equal* cores. The chip is eight Core Complex Dies (CCDs) stitched
+together over AMD's Infinity Fabric. Cores on the same CCD share fast local
+cache. Cores on *different* CCDs talk to each other over the fabric — and that is
+a completely different cost class.
+
+An atomic load from a cache line owned by a core on your own CCD is a handful of
+nanoseconds. An atomic load from a cache line living on another CCD has to cross
+Infinity Fabric: on the order of **80–120 ns**. Same instruction, one to two
+orders of magnitude more expensive, decided entirely by which die happens to own
+the line.
+
+Now look at what P2C does on that topology. Every request probes two random
+workers' busy flags. Random means "uniformly across 64 cores," which means those
+probes are almost always reading atomics owned by *other CCDs*. Every probe would
+be a fabric round-trip. The dispatcher's core function — cheap load balancing —
+would turn into a machine for generating cross-die atomic traffic.
+
+And the shape of that cost is brutal: every request fires several busy-flag probes,
+each one potentially a cross-die fabric hop that's one to two orders of magnitude
+slower than a local atomic. Under load, a large fraction of the dispatch budget
+would go — not to Python, not to the database, not to useful work — to cores on one
+die asking cores on another die whether they're busy. The optimization that
+eliminated queue contention on 8 cores would become the dominant cost on 64.
+
+> **Pyronova is open source.** If you want to see how the sharding rewrite shook out on many cores, the code is on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). A ⭐ helps, and `pip install pyronova` gets you running.
+
+## Sharding was treating the symptom
+
+The reflexive fix is to make sharding NUMA-aware: probe only workers on your own
+CCD, keep the atomics local. That would have helped. But sitting with the
+analysis long enough surfaced a more uncomfortable conclusion — we were
+optimizing the wrong layer entirely.
+
+Sharding was engineered to fix contention on a shared queue. But *why was there a
+shared queue?* Because tokio's work-stealing scheduler moves tasks between OS
+threads to balance I/O. That flexibility is the feature the whole dispatch layer
+was built around.
+
+Here's the thing: **we don't use that flexibility. It actively hurts us.**
+
+The actual compute work — running a Python handler — happens inside a
+sub-interpreter, and each sub-interpreter is pinned to a specific thread. It
+cannot move. A sub-interpreter's `PyThreadState` is bound to the thread that
+created it; you cannot hand its work to another thread. So the scheduler's
+signature ability — reassign a task to whichever thread is free — is something
+our workload can never take advantage of.
+
+Worse than useless, it's harmful. Every time the scheduler considers moving a
+task, it reads shared load state (those cross-CCD atomics). And every task
+reassignment, if it happened, would drag a request away from the core whose L1
+and L2 caches still hold its warm state. We built an elaborate sharding
+apparatus to reduce the contention created by a scheduler whose core service —
+mobility — is one our design forbids.
+
+The sharding trio was a well-built answer to the wrong question. The question
+wasn't "how do we shard the queue to reduce MPMC contention." It was "why is
+there a cross-thread queue at all, when the work can't cross threads."
+
+## The insight, stated plainly
+
+The illness was never the shared queue. It was work-stealing itself, applied to
+work that is pinned by construction. On 8 UMA cores that mismatch was invisible
+— the atomics were cheap enough that nobody noticed the layer was pointless. NUMA
+didn't create the problem; it just would price every cross-die atomic at fabric
+latency and make the tax visible. Reasoning through the target topology was an
+honest instrument: it exposed that a large share of dispatch would go to
+coordination we were never able to use.
+
+Two things make this worth writing down:
+
+First, **your fast path is only fast on the hardware you measured it on.** P2C +
+per-worker queues is genuinely good engineering on a single memory domain. The
+same code on a multi-CCD NUMA host inverts: the "cheap" atomic probe becomes the
+line item that dominates. If your benchmark machine and your deployment machine
+have different memory topologies, your dispatcher's cost model is a guess.
+
+Second, **an optimization that fixes a symptom can hide the disease.** Sharding
+made the shared-queue contention go away, which meant nobody had to ask whether
+the shared queue should exist. It let a fundamentally mismatched architecture —
+a mobile scheduler over immovable work — keep looking healthy for one more
+hardware generation. The fix wasn't a smarter shard. It was deleting the queue,
+the scheduler, and the stealing, and letting each core own exactly one thread,
+one runtime, and one sub-interpreter, end to end — the Thread-Per-Core
+re-architecture that this analysis forced.
+
+That's the next post. This one is just the analysis, because the analysis is the
+whole point: sometimes the most valuable thing a topology forces you to ask
+isn't "how fast" — it's "what fraction of my time would I be spending on work I
+can't use." Here it was a large enough share to justify throwing out an estimated
+two thousand lines.

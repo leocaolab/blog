@@ -1,0 +1,142 @@
+---
+title: "Async DB is still one query per worker"
+description: "The C-FFI bridge unblocked the database path from 3.7k to 27k req/s — then hit a structural ceiling. The bridge is sync-blocking, so each worker holds exactly one query in flight. Here's the plan to break it."
+date: 2026-07-07
+tags: [async, sub-interpreters, performance, benchmarks, rust]
+series: "pyre"
+seriesOrder: 31
+draft: false
+---
+
+The last time the database path came up, the story had a happy ending: a `gil=True`
+handler was funneling every query through one interpreter at 3.7k req/s, a C-FFI bridge
+let the sub-interpreter workers issue queries in parallel, and throughput jumped an
+order of magnitude. The bridge broke the GIL ceiling.
+
+It landed the path at a new one. Measured after the bridge shipped: **27,358 req/s** on the
+async-DB profile. That's a real, honest number — and it is *not* the GIL bottleneck the
+bridge was built to fix. It's the ceiling the bridge itself introduced. This post is about
+why that ceiling exists, why no amount of code-golfing the hot path can break it, and the
+plan that actually can.
+
+## Where a request's time goes
+
+The tell isn't the throughput number — it's the per-request budget underneath it. Break a
+single async-DB request into stages and one of them swallows almost everything:
+
+| Stage | Estimate |
+|---|---|
+| PG round-trip (incl. pool acquire, plan) | 0.8–1.5 ms |
+| Row decode, Rust → PyDict (×50 rows) | 100–200 µs |
+| `_rows_to_payload` Python loop + `json.loads(tags)` | 100–300 µs |
+| Response JSON serialize | 100–200 µs |
+| Bridge crossing (param serialize, channel send/recv) | 30–80 µs |
+| Sub-interp ↔ DB runtime hop | ~30 µs |
+
+The Postgres round-trip dominates — it's the majority of every request. And that's the
+tell. When your per-request time is dominated by *waiting on the network*, the question
+isn't "how do I make the work faster," it's "why is a worker idle-waiting instead of doing
+something else."
+
+## The structural ceiling: sync-blocking
+
+Here's the shape of the bridge as it shipped. When a handler calls
+`PG_POOL.fetch_all(...)`, the bridge does, in effect, `runtime.spawn(query)` followed by
+`channel.recv()` — it hands the query to a dedicated DB runtime and then **blocks the
+worker thread waiting for the answer**.
+
+The GIL is correctly detached during that wait, so other interpreters run — that's the
+whole point of the bridge, and it's why throughput is 27k and not 3.7k. But the *worker
+thread itself is parked*. For the full 0.8–1.5 ms of the Postgres round-trip, that worker
+is doing nothing except waiting. It cannot pick up another request.
+
+Which means the real invariant is: **one query in flight per worker.** Per-worker
+throughput is pinned to `1 / RTT`, and total throughput is just that times the worker
+count — that's the whole ceiling in one sentence. To go faster you need more
+workers or a shorter round-trip — and code optimization touches *neither*. You can shave
+every microsecond off the decode and serialize stages and the PG round-trip still parks
+the worker for a millisecond. The blocking wait is the ceiling.
+
+This is the frustrating kind of bottleneck: everything works, nothing is buggy, and the
+architecture has a hard cap that profiling the hot loop will never reveal, because the hot
+loop isn't hot — it's *waiting*.
+
+## The plan, ranked by ROI
+
+There are two categories of improvement here, and it's worth being clear about which is
+which. Some changes make each request cheaper (they raise the ceiling a little). One change
+removes the ceiling (it changes what "per worker" means). Here's the roadmap, ranked:
+
+**1. Response JSON serialization (+5–10%).** The response path currently builds an
+intermediate `serde_json::Value` tree before encoding. Replacing it with a direct
+Python → bytes writer skips the middle tree — and the ~50-row async-DB payload is exactly
+the mid-size case where that intermediate wastes the most. This one comes essentially for
+free if a separate JSON-writer rework lands first.
+
+**2a. Bulk row decode (+5–8%).** Today each of ~50 rows is reconstructed on the Python
+side as a `PyDict` with 9 columns — roughly 500 object allocations and 50 dict creations
+per request, all under the sub-interp GIL. Building the whole `PyList[PyDict]` once in Rust
+and handing back a single object across the bridge saves ~100 µs.
+
+**2b. Skip the Python intermediate entirely (+15–25%).** If a handler's whole job is
+`rows → JSON`, push the JSON encoding into the bridge itself: a new `fetch_all_json(...)`
+that returns finished bytes, and a `Response.from_bytes(...)` escape hatch on the Python
+side. That erases *both* the row-by-row `PyDict` materialization and the response
+serialization in one move. Bigger refactor, only worth it if the row shape is stable across
+the DB routes — but it's the biggest single per-request win available.
+
+**4. Prepared statement reuse (+5–10%).** `sqlx` re-prepares each query by default; caching
+prepared statements per pool, keyed by SQL hash, saves the Postgres-side parse and plan
+(~30–80 µs/query). Cheap, contained, and easiest to measure *before* the async work lands,
+while the bridge is still synchronous.
+
+Add all of those up and you're still fighting the same ceiling — you've made each request
+20–30% cheaper, so the worker parks for slightly less time, but it's still *one query per
+worker*. Which brings us to the change that's a different kind of thing entirely.
+
+> **Pyronova is open source.** The per-worker DB path, and everything behind this ceiling, is on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). Star it if multi-core Python is your problem too, or grab it with `pip install pyronova`.
+
+## 3. The real fix: an async bridge (+50–100%)
+
+The handler today is a plain `def`, so the bridge blocks. The ceiling-breaker is to make it
+`async def` and give the bridge an awaitable — `await PG_POOL.fetch_all_async(...)` — so a
+single worker can overlap queries instead of serializing them:
+
+- Issue query A, `await` it.
+- While A is out on the wire, service request B, issue *its* query, `await`.
+- When A's rows arrive, resume it and return the response.
+- Repeat.
+
+Per-worker throughput changes from `1 / RTT` to `concurrent_queries / RTT`. That's not a
+constant-factor speedup; it's a different denominator. It's the only item on the list that
+changes what a worker *is* during a database wait — from "parked" to "juggling."
+
+The machinery for this already exists. Pyronova has an async bridge from an earlier phase
+— the pattern that lets a sub-interpreter's event loop register a waker, have a Rust
+runtime resolve a future, and re-inject the result back into the interpreter's loop. That's
+already how non-DB async I/O works. Extending it to cover `sqlx` futures is mostly
+plumbing: route the DB future through the existing waker mechanism instead of blocking on a
+channel.
+
+The hard part isn't the plumbing, it's the testing. A synchronous bridge only ever has one
+query per worker in flight, so it never exercises the interleaving. An async bridge has
+multiple concurrent queries *on the same worker* — cancellation, partial completion,
+out-of-order resumption — paths the current bridge simply never hits. That's why this is a
+deliberate, sequenced piece of work rather than a quick patch: land the cheap per-request
+wins first, measure them in isolation while the bridge is still simple, and only then take
+on the async rework with its own test surface. It tracks against the existing async-bridge
+work and gets its own PR sequence.
+
+## Why this one is different
+
+The static-files problem had a lookup-table answer because the response was knowable ahead
+of time. The database has the opposite shape — every response depends on live data, so
+there's nothing to precompute. When the bottleneck is *waiting on someone else's network*,
+you can't make the wait shorter from inside your process; you can only stop wasting a worker
+while it happens.
+
+That's the honest state of the async-DB path: the C-FFI bridge broke the GIL ceiling and
+delivered a ~7× jump, and it landed on a structural ceiling that per-request optimization
+can chip at but not remove. The plan is real and sequenced, the async bridge is the piece
+that changes the denominator, and the number to beat is 27,358 — measured, not projected.
+When the async work lands, that's a results post, and it'll carry its own numbers.

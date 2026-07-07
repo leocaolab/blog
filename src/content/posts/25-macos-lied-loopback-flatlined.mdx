@@ -1,0 +1,136 @@
+---
+title: "macOS lied: why loopback flatlined at ~437k/core"
+description: "A benchmark that refused to scale with worker count led us to a kqueue + SO_REUSEPORT trap — and off macOS entirely."
+date: 2026-07-07
+tags: ["performance", "benchmarks", "linux", "http", "architecture"]
+series: "pyre"
+seriesOrder: 25
+draft: false
+---
+
+For weeks I benchmarked Pyronova on a Mac laptop and trusted the numbers. Pyronova
+is a Python web server built in Rust that runs N CPython sub-interpreters in one
+process — one GIL per interpreter, real parallelism — so the whole point of the
+project is that throughput should climb as you add workers. On the in-memory path,
+it did. On the real-TCP path, it didn't. And the way it *failed* to scale turned
+out to be a story about the kernel, not about our code.
+
+## The measurement that didn't move
+
+Our benchmark harness peels the server apart into layers (that's its own post),
+but two of those layers matter here. Both talk over real TCP on `127.0.0.1`, with
+the load generator living in the same process so there's no external client
+stealing CPU:
+
+- **Loopback Python** — a real request goes through the socket, through Hyper,
+  into a sub-interpreter, and a Python handler builds the response.
+- **Loopback Rust noop** — same socket path, but the route is served from a
+  pre-built byte array entirely in Rust. No GIL, no Python. This is the tightest
+  TCP-path ceiling the framework can hit.
+
+Here's what those two paths did on an Apple-silicon laptop (M5 Pro, 6 performance
+cores) as I scaled worker count from 1 to 6:
+
+| Path | w=1 | w=6 |
+|---|---|---|
+| In-mem Python (no TCP) | 1.04M req/s | 5.14M req/s (79% efficient) |
+| In-mem Rust noop (no TCP) | 2.17M req/s | 7.83M req/s |
+| **Loopback Python** | **335k req/s** | **333k req/s** |
+| **Loopback Rust noop** | **437k req/s** | **422k req/s** |
+
+Look at the bottom two rows. Six workers. Zero scaling. The Rust noop over TCP
+sat at ~437k req/s with one worker and ~422k with six — if anything it got
+*slightly worse*. Meanwhile the in-memory paths, which bypass the kernel
+entirely, scaled to 79% efficiency across six cores exactly like you'd hope.
+
+The in-memory path proves the framework and the sub-interpreter pool parallelize
+fine. So whatever was pinning loopback to ~437k lived in the one component the two
+paths don't share: the kernel's TCP + socket-accept machinery.
+
+## SO_REUSEPORT, and what it's supposed to do
+
+Pyronova uses `SO_REUSEPORT`: every worker opens its *own* listening socket bound
+to the same port. On Linux, the kernel then hashes each incoming connection's
+4-tuple (src IP, src port, dst IP, dst port) and hands it to one of the listeners.
+It's a kernel-level load balancer with no userspace dispatch, no shared accept
+lock, no thundering herd. Add a listener, get a bigger slice of the accept
+capacity. That's the mechanism that's *supposed* to make loopback scale with
+worker count.
+
+The keyword is *supposed*. `SO_REUSEPORT` is a BSD-family socket option that macOS
+also implements — but macOS is not Linux, and its kernel does not do the same
+thing with it.
+
+## The kqueue trap
+
+macOS's event notification core is `kqueue`, not `epoll`. When multiple sockets
+are bound to the same port with `SO_REUSEPORT` and registered with kqueue, the
+kernel does **not** spread connections across the listeners by 4-tuple hash the
+way Linux does. In practice it behaves like last-socket-wins: essentially all
+incoming connections get delivered to a single listener. The other five workers'
+accept loops sit there registered, polled, and idle.
+
+That's the whole mystery. Six workers, but only one of them is accepting the
+loopback flood. So the ceiling you measure is the *single-listener* ceiling —
+~437k req/s — and it doesn't matter whether you spawn 1 worker or 6 or 60,
+because 5 or 59 of them never see a connection. Worse, registering the extra
+`SO_REUSEPORT` listeners with kqueue isn't free, which is why the six-worker
+number came in a hair *below* the one-worker number instead of merely flat.
+
+This isn't a Pyronova bug and it isn't fixable in userspace. It's a property of
+how that kernel routes accepts. We ship a runtime detection for it: on Linux,
+Pyronova opens N independent accept loops; on macOS it detects that multi-accept
+buys nothing and **falls back to a single listener**, so you don't pay the kqueue
+registration overhead for listeners that will starve anyway.
+
+> **Pyronova is open source.** If a server that decides between `epoll` and `kqueue`
+> behavior at runtime interests you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`
+> and benchmark it on the kernel you actually deploy to.
+
+## Why the in-memory path lied *for* us
+
+The reason this took weeks to catch is that the in-memory benchmark path — the one
+that scaled beautifully — never touches a socket at all. It wires the client and
+server together with an in-process duplex pipe (`tokio::io::duplex`), so there's
+no `accept()`, no `SO_REUSEPORT`, no kqueue, no loopback copy. It measures the
+framework and the sub-interpreter pool in isolation, and *those* parallelize
+correctly on macOS.
+
+So every day the in-memory numbers told the honest story — "the framework scales"
+— and every day the loopback numbers told a true fact about the wrong machine:
+"this kernel won't fan out `SO_REUSEPORT` accepts." Both were measuring exactly
+what they measured. I was the one conflating "real TCP throughput on this laptop"
+with "real TCP throughput of the server."
+
+## The move to Linux
+
+Once we understood the flatline, the conclusion was blunt: **you cannot benchmark
+a `SO_REUSEPORT` multi-accept server on macOS.** The single most important scaling
+axis of the architecture — does throughput climb as you add per-core listeners? —
+is unobservable on a kernel that delivers all accepts to one socket. macOS was
+fine for correctness testing and for the in-memory framework ceiling, and that's
+where it stays in our workflow.
+
+For throughput we moved to bare-metal Linux (kernel 5.x+, where `SO_REUSEPORT`
+load-balancing, `TCP_DEFER_ACCEPT`, and `TCP_QUICKACK` all behave), with the
+server pinned to isolated cores so no background process could steal from it. The
+prediction was simple and falsifiable: the two loopback rows that flatlined on
+macOS should scale with worker count on Linux, because `epoll` + `SO_REUSEPORT`
+actually distributes connections across listeners.
+
+They did. That's the next post — 420k req/s and the optimization wave that got us
+there. But the lesson from this one outlives the specific numbers:
+
+- **A benchmark that doesn't scale isn't automatically your code's fault.** Isolate
+  the layer that isn't scaling before you optimize anything.
+- **Keep a kernel-free path in your harness.** The in-memory duplex path is what
+  let us prove the framework parallelized while the socket path was stuck — the
+  divergence between the two *was* the diagnosis.
+- **`SO_REUSEPORT` is not a portable contract.** It's a socket option with the same
+  name and materially different behavior on Linux vs the BSD/kqueue world. If your
+  scaling story depends on it, benchmark it on the kernel you deploy to.
+
+If you take one number away, take the shape of it: 437k, then 422k, for one worker
+then six. A flat line across your main scaling axis is the loudest signal in a
+benchmark. It's just pointing at the kernel, not at you.

@@ -1,0 +1,169 @@
+---
+title: "SharedState: cross-worker memory without Redis"
+description: "How Pyronova shares state across N sub-interpreters using Arc<DashMap> — nanosecond reads, zero dependencies, and one hard rule about PyObjects it never breaks."
+date: 2026-07-07
+tags: [python, rust, sub-interpreters, architecture, memory, performance]
+series: "pyre"
+seriesOrder: 14
+draft: false
+---
+
+Run one Python web server across N CPython sub-interpreters — one per core, each
+with its own GIL — and you get near-linear throughput. You also get a problem the
+single-process world never had to think about: **your global state is a lie.**
+
+```python
+GLOBAL_CACHE = {}   # looks like one dict
+```
+
+Under PEP 684, every sub-interpreter has its own copy of every module. Ten workers
+means ten independent `GLOBAL_CACHE` dictionaries, each empty at startup, each
+oblivious to the other nine. Write a session into worker 3's cache and worker 7 has
+never heard of it. The module-level dict that "just works" in a single-process
+Flask app silently fragments into N private islands.
+
+The reflex fix is Redis. Stand up a second process, pay a millisecond of loopback
+network per lookup, add a dependency to your deploy, and now your "single binary"
+Python server needs a sidecar to remember anything. For state that lives and dies
+inside one machine — sessions, counters, a cache of a computed result — that is a
+lot of ceremony to move bytes between threads that already share an address space.
+
+## Sink the state into Rust
+
+The workers are isolated at the *Python* level, but they are all threads in **one
+OS process**. They share a heap. The trick is to put the shared data somewhere
+both the language boundary and the concurrency model can agree on: the Rust heap.
+
+```rust
+#[pyclass]
+pub struct SharedState {
+    inner: Arc<DashMap<String, Vec<u8>>>,
+}
+```
+
+That is the whole idea. `DashMap` is a sharded concurrent hash map — different keys
+land in different shards, so two workers touching different keys never contend for a
+lock. `Arc` lets every worker hold a reference to the *same* map. From Python it
+looks like an ordinary dictionary:
+
+```python
+app.state["session:user_123"] = json.dumps({"role": "admin"})
+session = json.loads(app.state["session:user_123"])
+
+len(app.state)            # entry count
+"key" in app.state        # membership
+del app.state["key"]      # delete
+app.state.keys()          # all keys
+app.state.set_bytes(...)  # binary write
+app.state.get_bytes(...)  # binary read
+```
+
+Session management with zero Redis:
+
+```python
+@app.get("/login/{user}", gil=True)
+def login(req):
+    app.state[f"session:{req.params['user']}"] = json.dumps({"token": "xyz"})
+    return {"ok": True}
+
+@app.get("/auth/{user}", gil=True)
+def auth(req):
+    try:
+        return json.loads(app.state[f"session:{req.params['user']}"])
+    except KeyError:
+        return Response(body={"error": "unauthorized"}, status_code=401)
+```
+
+Or a live counter shared across every core:
+
+```python
+@app.get("/hit", gil=True)
+def hit_counter(req):
+    count = int(app.state.get("hits") or "0") + 1
+    app.state["hits"] = str(count)
+    return {"hits": count}
+```
+
+## The one rule SharedState will not break
+
+Here is the line that governs the entire design, and it is not a style preference —
+it is load-bearing:
+
+> **Never share a PyObject across interpreters.**
+
+A `PyObject` carries a reference count, and that refcount is protected by the GIL of
+the interpreter that created it. Hand that pointer to another sub-interpreter and you
+have two GILs mutating one refcount with no lock between them — a data race on the
+most fundamental invariant CPython has. The payoff is a segfault, and it will show up
+under load, in production, three days after you shipped.
+
+So `SharedState` stores `Vec<u8>` — plain bytes — not Python objects. The values in
+that map are never PyObjects. At the boundary, Rust converts: your `str` becomes
+bytes on the way in, and comes back out as a fresh Python `str` **owned by the
+calling interpreter**. Nothing that CPython refcounts ever crosses the interpreter
+line. That is why serialization (`json.dumps` on the way in, `json.loads` on the way
+out) is not incidental overhead here — it is the mechanism that keeps the isolation
+honest. The map is a mailbox for bytes, and every interpreter unpacks its own copy.
+
+> **Pyronova is open source.** If sharing bytes across sub-interpreters without a
+> Redis sidecar sounds useful, ⭐ the repo at
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`
+> and try SharedState yourself.
+
+## What it costs
+
+A `DashMap` read is a hash, a shard lookup, and a memcpy — nanosecond-scale, entirely
+in-process. There is no network, no serialization framing, no second process to wake
+up. In an isolated read benchmark through a `gil=True` route:
+
+```
+GET /get/user:1 (DashMap read via GIL route):
+  73,720 req/s, 4.4ms avg latency
+```
+
+Read that number correctly. The 73k ceiling is **not** the map — DashMap itself is
+orders of magnitude faster than that. The bottleneck is everything wrapped around the
+read: `spawn_blocking` thread switching and GIL acquisition for the `gil=True` route.
+The map access is the cheap part. And adding SharedState did nothing to the fast
+sub-interpreter hot path, which kept running at its usual throughput right
+alongside it.
+
+That last point mattered enough to verify directly. SharedState landed in the same
+release as async-handler auto-detection, and the regression suite compared the round
+before and after across the full scenario matrix:
+
+| Scenario | Before | After | Change |
+|----------|--------|-------|--------|
+| Hello World | 211,019 | 216,297 | +2.5% |
+| JSON small | 212,521 | 214,185 | +0.8% |
+| JSON medium | 63,649 | 67,376 | +5.9% |
+| Parse 7KB JSON | 90,867 | 96,400 | +6.1% |
+
+Zero regression. The `Arc` reference count and the slightly larger `PyronovaApp` struct
+are constant-time costs that never touch the request path.
+
+## Where it fits, and where it doesn't
+
+SharedState is not a Redis replacement — it is a different tool that covers the cases
+where Redis was overkill.
+
+| Dimension | Pyronova SharedState | Redis |
+|-----------|----------------------|-------|
+| Latency | Nanosecond (in-memory read) | Millisecond (network I/O) |
+| Deployment | Zero dependencies | Separate Redis process |
+| Data types | String / bytes | Rich, with serialization cost |
+| Scope | Single process | Distributed, persistent |
+| Best for | Sessions, cache, counters | Cross-host, durability |
+
+If you need data to survive a restart, or to be shared across *machines*, you still
+want Redis — SharedState lives and dies with the process. But for the enormous middle
+ground of "N workers on one box that need to agree on some bytes," a sharded map on
+the Rust heap is faster, simpler, and has nothing to deploy.
+
+Two honest limitations remain. Today `app.state` requires a `gil=True` route, because
+the PyO3 `#[pyclass]` can't be handed directly to a sub-interpreter — the plan is to
+inject a `_state` handle into each sub-interpreter's globals over the same C-FFI
+channel the workers already use, giving native access from the fast routes. And values
+are strings and bytes only; a `moka`-backed cache with TTL expiry (so sessions clean
+themselves up) is the next step. Both are additive. The core stays the same: shared
+bytes on the Rust heap, and not one PyObject across the line.

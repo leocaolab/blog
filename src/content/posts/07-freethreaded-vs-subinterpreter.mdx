@@ -1,0 +1,118 @@
+---
+title: "Free-threading or sub-interpreters? We tried both"
+description: "Two opposite ways to get multi-core Python: remove the GIL (PEP 703) or multiply it (PEP 684). On CPU-bound work they land in the same ballpark — so the choice is about isolation and the C-extension ecosystem, not raw speed."
+date: 2026-07-07
+tags: [python, gil, sub-interpreters, benchmarks, performance]
+series: "pyre"
+seriesOrder: 7
+draft: false
+---
+
+There are two ways to run Python on many cores inside a single process, and
+they're philosophically opposite.
+
+**Free-threading** (PEP 703, the `python3.14t` build) *removes* the GIL. One
+interpreter, many OS threads, all executing bytecode at once, all sharing one
+object graph. **Sub-interpreters** (PEP 684) *multiply* the GIL: N interpreters
+in one process, each with its own GIL and its own isolated object graph, nothing
+shared.
+
+Free-threading is the one everyone's excited about — the "just delete the GIL"
+dream. Sub-interpreters are the weirder, more conservative bet. Pyronova is built
+on sub-interpreters, so the obvious question is: did we pick the slower one? We
+ran all three paths — free-threaded threads, sub-interpreters, and Pyronova's
+engine — to find out.
+
+## A test you can run yourself
+
+Nothing fancy: a handler that does a few milliseconds of real Python CPU work
+(`sum(i*i for i in range(200_000))`), driven with `wrk -t4 -c64` for 6 seconds,
+16 workers on both sides, an 18-core box. First, does free-threading even
+parallelize? Pure Python, no server:
+
+| 8 CPU tasks across 8 threads | speedup |
+|------|---------|
+| GIL build (`python3.14`) | **1.05×** — threads serialize, as expected |
+| Free-threaded (`python3.14t`) | **4.71×** — real multi-core |
+| Sub-interpreters (`InterpreterPoolExecutor`, GIL build) | **4.50×** |
+
+So free-threading is real: remove the GIL and threads genuinely run in parallel.
+And sub-interpreters get you there too, on a *stock* GIL build, without touching
+the lock. Two roads, same destination.
+
+Now the same CPU handler behind an actual HTTP server:
+
+| Approach (16 workers) | req/s |
+|------|-------|
+| Pyronova, sub-interpreter engine | **~2,730** |
+| Sub-interpreters (stdlib `InterpreterPoolExecutor`) | ~2,480 |
+| Free-threaded threads | ~2,420 |
+| Single GIL, threads | ~225 |
+
+Read the top group carefully. On CPU-bound work, **free-threading and
+sub-interpreters are in the same league** — both crush the single-GIL baseline
+~11×, because both actually use the cores. But it's not a dead heat:
+sub-interpreters came out **consistently a hair ahead**. At the fairest
+comparison — free-threaded threads vs. the stdlib sub-interpreter pool, same
+dispatch style — it's ~2,480 vs ~2,420, a small but repeatable ~2–3% edge to
+sub-interpreters. Pyronova's tuned Rust engine widens the gap further, but that's
+implementation, not the model.
+
+That small, steady margin is exactly what you'd expect: free-threading pays an
+**atomic-refcount tax** on shared-object access that sub-interpreters simply don't
+have. The effect is real — it's just *small*, a few percent on this workload, not
+the blowout the "we removed the GIL and it did nothing" story implies. Both
+approaches genuinely parallelize; one just carries a little more overhead per
+object touch.
+
+> **Pyronova is open source.** If you'd rather multiply the GIL than delete it, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## So why did we pick sub-interpreters?
+
+The ~2–3% edge above is real but far too small to build a decision on. We picked
+sub-interpreters for three reasons that have little to do with that margin:
+
+**1. The C-extension ecosystem isn't free-threading-ready.** Free-threading only
+helps if your whole stack is free-threading-safe. Today most compiled extensions
+still assume the GIL exists; a PyO3/C module that doesn't explicitly declare
+free-threaded support will make CPython *quietly re-enable the GIL at import
+time* — so you can ship on `python3.14t` and unknowingly get single-core behavior.
+Sub-interpreters have their own compatibility rules, but the failure mode is a
+loud `ImportError`, not a silent de-parallelization.
+
+**2. Isolation is a feature, not just a constraint.** Ten interpreters with ten
+GILs and no shared mutable state means no data races *by construction* — one
+request can't corrupt another's globals, and a crash in one interpreter doesn't
+poison the rest. Free-threading gives you shared memory and, with it, all the
+shared-memory bugs.
+
+**3. No atomic-refcount tax.** This is the subtle one, and it's about *cost
+conservation*:
+
+| | passing data between workers | every object access |
+|---|---|---|
+| **free-threading** | zero-copy — same heap, shared pointer | pays **atomic refcounts + per-object locks** |
+| **sub-interpreters** | **must copy / marshal** at the boundary | no atomic tax — each GIL protects its own heap |
+
+Neither is free. Free-threading never copies data between threads (they share the
+object graph), but it pays for that on *every* incref/decref, which Python does
+constantly. Sub-interpreters pay nothing per access, but you can't share a live
+Python object across the boundary — data crosses as bytes. For a web server
+handing short, self-contained requests to Python — little cross-request sharing,
+lots of independent work — the sub-interpreter side of that ledger is the cheaper
+one.
+
+## The honest caveats
+
+This is a quick, CPU-bound micro-benchmark on macOS, not a rigorous framework
+shootout — treat the numbers as "same order of magnitude," not gospel.
+Free-threading is also young and improving fast; the atomic-refcount overhead is
+an active upstream optimization target, and a future build could tilt the CPU
+numbers in its favor. And the models genuinely diverge on workloads we didn't
+test here: if your requests need to **share large mutable state**, free-threading's
+shared memory wins outright — isolated interpreters would copy that state on every
+crossing. These are different tools for different shapes of problem.
+
+But for the shape *we're* building for, the measured answer was clear: the two
+multi-core paths are peers on throughput, so we chose the one whose isolation and
+ecosystem story we trust — and multiplied the GIL instead of removing it.

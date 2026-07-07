@@ -1,0 +1,144 @@
+---
+title: "C++ speed, Python soul: the problem that started Pyronova"
+description: "The backend that needs C++ throughput and Python's ecosystem at the same time — and why the GIL forces you to pick one."
+date: 2026-07-07
+tags: [python, gil, performance, architecture, sub-interpreters]
+series: "pyre"
+seriesOrder: 1
+draft: false
+---
+
+Every interesting backend I've worked on eventually runs into the same wall, and it's
+always the same shape. The product needs the throughput of a systems language and the
+ecosystem of Python, in the same process, on the same request path — and Python's runtime
+tells you that you can have one or the other, not both.
+
+Pyronova started as the HTTP layer for exactly that kind of service: a latency-sensitive
+Python backend that had to do real work on every request. Let me describe the class of
+workload before I describe the wall, because the wall only matters if you're actually
+standing in front of it.
+
+## Two workloads, one impossible requirement
+
+**AI agent backends.** An agent server handles thousands of concurrent LLM calls, RAG
+queries, and tool invocations. Almost all of it is I/O — you `await` a vector database,
+you `await` an LLM that takes 2–5 seconds to answer, you `await` a log write. Here's a
+realistic call chain:
+
+```python
+@app.get("/chat")
+async def chat(req):
+    prompt = req.json()["prompt"]
+    docs     = await vector_db.search(prompt)      # network I/O — ~20 ms
+    response = await llm.chat(prompt, context=docs) # network I/O — ~2000 ms
+    await db.insert_log(prompt, response)           # network I/O — ~5 ms
+    return {"reply": response}
+```
+
+That's ~2025 ms of wall-clock time and under 1 ms of CPU. The bottleneck is entirely
+I/O concurrency: how many of these can you have in flight at once before the server falls
+over.
+
+**Quantitative trading gateways.** A market-data gateway ingests hundreds of real-time
+feeds simultaneously — WebSocket order books coming in, REST orders going out, auth and
+risk checks in the middle. Again, mostly I/O, with a thin layer of light CPU (parsing,
+validation, routing) and an occasional burst of heavy CPU (a numpy reduction, a risk
+model).
+
+Both workloads want the same three things at once: **high I/O concurrency**, **low
+memory**, and **the ability to occasionally do real CPU work in Python without stalling
+everything else**. And that combination is precisely what the GIL won't give you.
+
+## The GIL: one lock, one core
+
+Python's Global Interpreter Lock is a single mutex that guards the interpreter. Only one
+thread can execute Python bytecode at a time. It exists for good reasons — it makes
+reference counting and C-extension state simple — but the consequence is brutal and
+non-negotiable: **one lock, one core, no parallelism.**
+
+Threading doesn't rescue you. Python threads share the one GIL; they take turns, they
+don't run at once. Adding threads to a CPU-bound Python workload adds context-switch
+overhead and buys you nothing. It's concurrency theater, not parallelism.
+
+So every framework built on CPython inherits the same constraint, and every one of them
+works around it with a compromise. The compromises are what force the choice.
+
+## What everyone does, and what it costs
+
+**FastAPI chose async on a single core.** It's genuinely elegant for I/O — one event
+loop, `await` everywhere, thousands of connections. But it's still one GIL on one core.
+The moment a single request does something CPU-heavy — JSON parsing, Pydantic validation,
+a numpy computation — it blocks the *entire* event loop, and every other in-flight request
+waits behind it. To use more than one core you run Gunicorn with N workers, which means N
+full copies of the Python runtime, N copies of your loaded modules, N times the memory. On
+a plain-JSON baseline a single worker measures around 9,000 req/s.
+
+**Robyn replaced the Python event loop with Rust.** The I/O layer is actix-web, which is fast.
+But the Python handlers still run under one GIL, so scaling still means spawning OS
+processes — `--fast` runs 22 of them, and they eat hundreds of megabytes of RAM. The Rust
+layer is quick; the Python layer is still the ceiling. In a numpy microbenchmark those 22
+processes genuinely win — 22 independent interpreters is real multi-core — but you paid for
+it in memory and process-coordination complexity.
+
+**Free-threaded Python (PEP 703)** removes the GIL entirely. It's the most direct answer
+and it's a real, serious effort. But removing the lock makes every individual Python object
+operation slower — reference counting has to become atomic — and most of the C-extension
+ecosystem assumes the GIL exists. It trades one problem for another, and the ecosystem
+isn't ready.
+
+Line them up and the trade is stark:
+
+```
+FastAPI:  1 process  × 1 GIL  × async tricks     = fast I/O, slow CPU, 9k QPS
+Robyn:    16 processes × 16 GILs × 3× memory      = brute force, 156k QPS, 583 MB
+```
+
+Async gives you I/O concurrency but not CPU parallelism. Multiprocessing gives you CPU
+parallelism but not shared memory. Free-threading gives you both but taxes single-threaded
+speed and breaks your dependencies. You are being asked to pick a corner.
+
+> **Pyronova is open source** — it's the server this exact requirement produced. If
+> C++ throughput with Python's soul is a wall you've hit too, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Why not just add multiprocessing and be done?
+
+This is the obvious escape hatch, and it's worth being honest about why I didn't take it —
+because in one benchmark it clearly wins. Robyn's 22-process `--fast` mode beats a
+single-process design 3.7× on a numpy `mean` over 10k elements (31,261 vs 8,507 req/s),
+because 22 processes are 22 GILs and numpy's C module flatly refuses to load more than once
+per process, so a single-process design is stuck running that route on one core.
+
+The reason not to chase it: it destroys the thing that makes the architecture worth
+building. Look at the real load distribution of these services. On a typical backend
+roughly 95% of the work is I/O — database, API, cache, files — about 4% is light CPU
+(serialization, validation, routing), and maybe 1% is heavy CPU (numpy, pandas, ML
+inference). Bolting a multiprocess architecture onto the whole server to win the 1% case
+means paying the memory tax and the IPC tax on 100% of requests. You'd fit 12 workers in a
+512 MB container instead of 16. You'd need Redis to share state that used to be a dict.
+You'd have turned into another Gunicorn variant.
+
+And doing heavy `pandas.groupby().rolling()` inside a web handler is an anti-pattern
+regardless of framework — that work belongs in a background worker or a compute engine, not
+on the request path. The web tier's job is to accept and dispatch I/O at high concurrency,
+cheaply.
+
+## The requirement, stated plainly
+
+So the problem that started Pyronova is a requirement that no single existing compromise
+satisfies:
+
+- Serve I/O-bound requests at high concurrency, like async does.
+- Run CPU-bound Python on *every* core, like multiprocessing does.
+- Do it in one process, with shared memory and one set of file descriptors, so it's cheap
+  to deploy and coordinate.
+- Keep the Python ecosystem — because the entire reason the service is written in Python is
+  the libraries, the hiring pool, and the iteration speed.
+
+C++ throughput. Python soul. The GIL says pick one.
+
+The interesting part — the reason there's a project to write about at all — is that since
+Python 3.12 there's a fourth option that isn't on the usual list, and it doesn't require
+removing the GIL or duplicating the process. It requires *multiplying* the GIL: N
+independent interpreters, each with its own lock, inside one process. That's the bet the
+rest of this series is about.

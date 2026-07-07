@@ -1,0 +1,162 @@
+---
+title: "Taking GC out of the hot path"
+description: "Python's stop-the-world GC fires hundreds of times a second at 400k rps. Disabling it per sub-interpreter and controlling collection from Rust cuts P99 by ~10× at basically no throughput cost."
+date: 2026-07-07
+tags: [python, gc, performance, sub-interpreters, benchmarks, memory]
+series: "pyre"
+seriesOrder: 24
+draft: false
+---
+
+CPython's garbage collector stops the world when it runs. For a batch script
+nobody notices. For a latency-sensitive server it's a landmine, because the
+pauses scale with generation:
+
+- Gen0 collection: ~0.1 ms — usually invisible
+- Gen1 collection: ~1–5 ms
+- Gen2 collection: ~10–50 ms — long enough to blow a tail-latency budget
+
+The insidious part is that this has nothing to do with your CPU being busy or
+your memory leaking. You can be at 30% CPU with flat RSS and still see 45 ms
+latency spikes, because the GC decided to walk the heap mid-request. If you've
+ever stared at a metrics dashboard showing periodic latency spikes that don't
+correlate with load or memory, the collector is the prime suspect.
+
+## Why it's worse under a sub-interpreter server
+
+Pyronova runs N sub-interpreters, each with its own GIL and its own GC. That's
+good — a collection freezes only one worker, not the whole process. But the
+trigger frequency is the problem. CPython's default heuristic collects Gen0
+roughly every 700 net allocations. A Python handler allocates constantly:
+request objects, dicts, the response. At 400k+ req/s, that 700-allocation
+threshold trips **hundreds of times per second, per worker.** Each trip is a
+stop-the-world pause on the request path. This is the single biggest source of
+uncontrollable P99 tail latency at high throughput — not the collection cost
+itself, but that it fires unpredictably, sometimes right in the middle of your
+busiest moment.
+
+The fix isn't to collect less. It's to collect *somewhere other than the request
+path.*
+
+## Smart GC: disable the default, control the timing
+
+Since v2.2.1, every sub-interpreter calls `gc.disable()` at startup and hands
+collection timing to the Rust engine. Reference counting still reclaims the vast
+majority of objects immediately, as it always does — `gc.collect()` only exists
+to break reference cycles, and you get to choose *when* that sweep happens. All
+three strategies share one goal: the pause never lands on a request that's being
+served.
+
+You pick the strategy with an environment variable.
+
+### Mode 1 — `count` (default)
+
+```bash
+PYRONOVA_GC_MODE=count
+PYRONOVA_GC_THRESHOLD=100000   # collect every 100k requests; set 0 to fully disable
+```
+
+Run a full `gc.collect()` every N requests instead of every 700 allocations.
+Simple, predictable, and a fine default for ordinary web backends, RPC gateways,
+and AI agents. For a workload that creates zero reference cycles you can set the
+threshold to `0` and turn collection off entirely.
+
+### Mode 2 — `idle` (for latency-sensitive workloads)
+
+```bash
+PYRONOVA_GC_MODE=idle
+PYRONOVA_GC_IDLE_MS=100        # time-wheel tick
+PYRONOVA_GC_OOM_FAILSAFE=50000 # forced sweep after 50k req to prevent OOM
+```
+
+Only collect when the accept queue has been idle for at least
+`PYRONOVA_GC_IDLE_MS`. By definition, **P99 never contains a GC pause** — the
+collection physically cannot run while requests are queued. A failsafe forces a
+sweep after 50k requests without a collection so a permanent traffic flood can't
+grow memory without bound.
+
+### Mode 3 — `off`
+
+```bash
+PYRONOVA_GC_MODE=off
+```
+
+Zero framework-level triggering. You call `gc.collect()` yourself or rely purely
+on reference counting. This suits tick-driven systems that have a natural
+boundary — do the work, then collect once the tick is done, on your schedule.
+
+## What it buys you
+
+Measured on the same 7840HS, an 8-worker thread-per-core config, a zero-cycle
+"hello" workload:
+
+| Mode | req/s | P99 |
+|---|---|---|
+| count (default) | 459k | **231 µs** |
+| idle | 449k | **238 µs** |
+| off | 439k | **241 µs** |
+| CPython auto (default GC) | ~440k | **~2 ms** |
+
+One caveat on these figures: they come from Pyronova's GC optimization guide — a
+single-config local run (one box, one zero-cycle workload), not a formal
+benchmark-suite result. A chronology note too, since this post runs a little
+ahead of its hardware story: the 459k here is a favorable zero-cycle micro-run on
+the 7840HS, and on the Linux box we'll properly introduce a couple posts from
+here, careful plaintext benchmarking settles around a ~420k ceiling — so don't
+read 459k as outranking those later, more disciplined numbers. Read the ~10× as
+an order-of-magnitude effect on this setup, not a precise, portable multiplier.
+
+The story is in the last row versus the rest. Taking over GC timing improves P99
+by roughly **10×** — from ~2 ms down to ~230 µs — while throughput barely moves.
+That's the whole pitch: you are not collecting less garbage or leaking memory,
+you're just refusing to let the collector interrupt a request in flight. The tail
+latency that was noise becomes a floor.
+
+Note the three managed modes are within a few percent of each other on both
+throughput and P99. The big jump is disabling the default heuristic at all; the
+choice between count, idle, and off is a matter of *which* guarantee you want,
+not a raw-speed tradeoff.
+
+> **Pyronova is open source.** If keeping stop-the-world GC pauses off the request
+> path is a problem you recognize, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Why `idle` over `count` when the tail really matters
+
+`count` has one theoretical failure mode. The moment the request counter hits its
+threshold might, by pure bad luck, be the peak of a traffic burst — and *that*
+request eats the collection latency. It's rare, but for the workloads where P99
+is a hard contract, "rare" isn't good enough.
+
+`idle` closes that hole by construction: it collects only when nothing is
+queued, so it physically pushes every pause into a quiet window. The OOM failsafe
+is the honest bound on that promise — under a sustained flood the accept queue
+may never drain, so after 50k requests the failsafe forces one sweep. That is a
+controlled, observable, self-protective pause, exactly once, versus CPython's
+default firing *thousands* of stop-the-world collections over the same window at
+10–50 ms each.
+
+If you run `idle`, watch the gap since the last collection so you know the
+failsafe isn't quietly carrying you:
+
+```python
+@app.readiness_check("gc_lag")
+def gc_lag(req):
+    elapsed = time.monotonic() - app.state.get("last_gc_ts", 0)
+    # idle mode: expect < 500ms. Over 5s means traffic is saturating the queue,
+    # the failsafe is tripping often, or the box is overloaded.
+    return {"status": "ok" if elapsed < 5.0 else "degraded",
+            "gc_lag_seconds": elapsed}
+```
+
+## The general principle
+
+None of this makes the GC faster. It makes the GC *scheduled* — moved off the
+axis where you measure it. That's a recurring pattern for latency-sensitive
+Python: the cost you can't remove, you relocate to where nobody's waiting on it.
+CPython's default collector optimizes for steady memory reclamation without
+tuning, which is the right default for most programs. A server serving hundreds
+of thousands of requests a second is not most programs. Disabling the per-worker
+heuristic and controlling the sweep from the engine gives back ~10× on P99, and
+the only thing you trade is the illusion that you were ever supposed to let a
+stop-the-world pause fire mid-request.

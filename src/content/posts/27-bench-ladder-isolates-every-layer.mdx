@@ -1,0 +1,149 @@
+---
+title: "A bench ladder that isolates every layer"
+description: "Four benchmarks that peel a Python-in-Rust server into framework, kernel, and Python — so a flat line points at the right layer instead of the wrong optimization."
+date: 2026-07-07
+tags: ["benchmarks", "performance", "architecture", "linux", "python", "sub-interpreters"]
+series: "pyre"
+seriesOrder: 27
+draft: false
+---
+
+Most web-server benchmarks give you one number: requests per second, one route,
+one config. That number is nearly useless when it *disappoints you*, because it
+can't tell you which layer ate the throughput. Is it the framework? The kernel's
+TCP path? The Python handler? A single number folds all three together and hands
+you a mystery.
+
+Pyronova is a Rust web server running N CPython sub-interpreters in one process,
+and the most useful tool we built for it isn't a feature — it's a **benchmark
+ladder**: four benches that each add exactly one layer, so the gap between two
+rungs is the cost of the layer they don't share. This is the harness that caught
+the macOS `SO_REUSEPORT` flatline, and it's the one I reach for first whenever a
+number moves the wrong way.
+
+## The two axes
+
+The ladder varies two independent things:
+
+1. **Kernel or not.** Either the request crosses a real TCP socket on
+   `127.0.0.1`, or the client and server are wired together in-process with a
+   duplex pipe (`tokio::io::duplex`) — same code path minus `accept()`, the
+   loopback copy, and the `epoll`/`kqueue` wakeup.
+2. **Python or not.** Either a real Python handler runs in a sub-interpreter, or
+   the route is served from a pre-built byte array entirely in Rust (registered
+   via `add_fast_response`) — the framework does all its parsing, routing, and
+   response building, but no GIL is ever acquired.
+
+Two axes, four rungs:
+
+| Bench | Kernel? | Python? | Isolates |
+|---|---|---|---|
+| `bench_inmem` | no | yes | framework + sub-interpreter, upper bound |
+| `bench_inmem_noop` | no | no | framework alone (Hyper parse + route + build) |
+| `bench_loopback` | yes | yes | the full real-world path |
+| `bench_loopback_noop` | yes | no | tightest measurable TCP-path ceiling |
+
+## Reading the gaps
+
+The rungs are only interesting in pairs. Each gap has a name.
+
+**`inmem` minus `inmem_noop` = the per-request Python cost.** Same framework, same
+no-kernel path; the only difference is whether a sub-interpreter runs. On an
+Apple-silicon laptop (M5 Pro, 6 P-cores) this was 2.17M req/s noop vs 1.04M req/s
+with Python at one worker — so the sub-interpreter GIL acquire, the handler call,
+and the response extraction cost roughly *half the request budget*. That's not a
+number you can back out of a single end-to-end benchmark; you need the two rungs
+side by side.
+
+**`inmem_noop` minus `loopback_noop` = the pure kernel/TCP tax.** Same framework,
+no Python on either side; the only difference is whether the bytes crossed a real
+socket. This is syscall overhead + TCP state machine + loopback copy + event-loop
+wakeup, with nothing else mixed in.
+
+**`inmem` minus `loopback` = the same kernel tax, but on the realistic path** where
+Python is also in play. If this gap is much bigger than the noop kernel gap, the
+kernel and the GIL are contending; if it's the same, they're independent.
+
+The value of the ladder is that each of those three costs is *measured directly*
+as a difference of two adjacent rungs, not inferred from a model. When a number
+regresses, you re-run the ladder and the gap that changed tells you which layer
+to go look at.
+
+## The flatline it caught
+
+Here's the ladder that started the whole Linux migration, run on the same laptop,
+scaling workers from 1 to 6:
+
+| Path | w=1 | w=6 |
+|---|---|---|
+| In-mem Python | 1.04M | 5.14M (79% efficient) |
+| In-mem Rust noop | 2.17M | 7.83M |
+| Loopback Python | 335k | 333k (flat) |
+| Loopback Rust noop | 437k | 422k (flat) |
+
+The top two rungs — no kernel — scaled to ~79% efficiency across six cores. The
+bottom two — real TCP — didn't scale *at all*. Because the ladder isolates the
+kernel as its own variable, the diagnosis was immediate: the framework and the
+sub-interpreter pool parallelize fine; the thing that won't scale lives entirely
+in the layer the loopback rungs add and the in-mem rungs don't. That turned out to
+be macOS delivering every `SO_REUSEPORT` accept to a single listener. Without the
+ladder, all you'd see is "loopback is stuck at 437k" and you'd waste a week
+optimizing Python that was never the problem.
+
+> **Pyronova is open source**, benchmark ladder and all. If decomposing a server layer by
+> layer interests you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`
+> and run the rungs on your own box.
+
+## The external client is a fifth rung
+
+Everything above runs the load generator *inside the server process*, which is
+deliberate: it removes the external client's own CPU cost from the measurement, so
+you're timing the server and not the benchmark tool. But the number a real client
+sees is what actually matters in production, so the harness also runs `wrk` from
+outside against a live server.
+
+The relationship is a sanity check: **the external `wrk` number is always ≤ the
+in-process `loopback` number at the same worker count**, by definition — the
+external client is now spending CPU too, and on a shared box it's stealing cycles
+from the server. If you pin the generator to its own cores (`taskset -c 60-63 wrk
+...` while the server owns cores 0..N-1) the gap shrinks to just the extra socket
+hop. If the external number is *wildly* below the in-process one, your client is
+the bottleneck, not the server — which is its own useful thing to know before you
+"optimize" anything.
+
+## Why the workers size to physical cores
+
+One subtlety the ladder made unavoidable: how many workers do you spawn? Pyronova's
+thread-per-core mode sizes itself to **physical** cores, not logical ones. It reads
+`/sys/devices/system/cpu/.../thread_siblings_list` and strips SMT siblings, so on
+an 8C/16T chip you get 8 per-core threads, not 16.
+
+The reason is what the ladder measures. The in-mem Python rung is CPU-bound — it's
+running interpreter bytecode flat out. Two SMT threads on one physical core share
+that core's ALU, FPU, and L1/L2, so a second sub-interpreter pinned to the sibling
+lane doesn't get a second core's worth of throughput; it gets maybe 20–30% more,
+while adding cache pressure and scheduling noise that widens your P99. Sizing to
+physical cores keeps each interpreter on a lane it isn't fighting a sibling for,
+which is exactly the regime where the in-mem scaling efficiency (that 79%) holds
+up. Hyper-threading isn't useless here — it's a modest uplift on the Python layer —
+but it's not a core, and pretending it is just adds variance.
+
+## What the ladder is really for
+
+The deliverable of a benchmark shouldn't be a trophy number. It should be a
+*decomposition*: here is how much of a request is framework, here is how much is
+kernel, here is how much is Python, and here is which of those three just changed.
+
+- **Keep a kernel-free rung.** It's the only way to prove your framework
+  parallelizes independent of whatever the socket layer is doing.
+- **Keep a Python-free rung.** It's the only way to price the interpreter without
+  guessing.
+- **Measure costs as gaps between adjacent rungs,** not as fractions of one
+  end-to-end number.
+- **Run an external client too,** but treat it as a bound on the in-process number,
+  not a replacement for it.
+
+When a benchmark regresses, this is the difference between "throughput dropped, go
+guess" and "the `loopback` gap widened but the `inmem` gap didn't — go look at the
+socket path." One of those is engineering.

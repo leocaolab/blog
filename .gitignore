@@ -17,3 +17,7 @@ node_modules/
 # GUARDRAIL: unpublished drafts and any internal strategy notes never go public.
 # Keep work-in-progress here; promote to src/content/posts/ only when finished.
 drafts/
+
+# Local-only preview of drafts (rendered so you can click through series nav).
+# Gitignored so `git add -A` in publish.sh can never ship these by accident.
+src/content/posts/_preview/

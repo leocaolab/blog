@@ -1,0 +1,84 @@
+---
+title: "97% of pure Rust: how thin can the Python layer be?"
+description: "Running Python handlers across N sub-interpreters lands within 3-7% of pure-Rust Axum. Here's the measurement, and why the GIL — not Python — is the tax."
+date: 2026-07-07
+tags: [python, rust, performance, gil, sub-interpreters, benchmarks]
+series: "pyre"
+seriesOrder: 10
+draft: false
+---
+
+There's a folk belief that putting Python in your request path costs you an order of magnitude. You reach for a Rust or Go web server "because Python is slow," and the received wisdom is that anything with a `def handler(req)` in the hot loop is going to bleed throughput.
+
+That belief is mostly wrong. What's actually slow is the **GIL** — the global lock that serializes one process's Python onto a single core. If you remove the serialization while keeping the interpreter, the Python execution itself is close to free. Pyronova is a Rust web server (Tokio + Hyper + matchit, essentially the Axum stack) that runs N CPython sub-interpreters in one process, each with its own GIL under PEP 684. So the natural question is: with that architecture, **how thin can the Python layer get?**
+
+We measured it against the pure-Rust ceiling.
+
+## The setup
+
+Same machine, same load generator, same trivial handlers — a JSON-returning `GET /` and a path-param `GET /hello/{name}`. The point of trivial handlers is to isolate framework overhead: if the handler does almost nothing, whatever throughput you lose is the cost of the plumbing, not the business logic.
+
+- **Environment:** macOS ARM64 (Apple Silicon), Python 3.14.3, Rust 1.93.1, wrk 4.2.0
+- **Load:** `wrk -t4 -c256 -d10s`
+
+The contenders: Actix-web and Axum as the pure-Rust ceiling, Pyronova in two modes (sub-interpreter and single-GIL), and Robyn as a Python peer that also sits on a fast Rust core (Actix).
+
+## The numbers
+
+| Rank | Framework | GET / req/s | GET /hello req/s | Avg Latency | Memory (RSS) |
+|------|------|------------|-----------------|----------|-----------|
+| 1 | Actix-web (pure Rust) | 226,042 | 208,796 | 1.00ms | 11 MB |
+| 2 | Axum (pure Rust, same stack as Pyronova) | 223,845 | 220,891 | 0.86ms | 14 MB |
+| 3 | **Pyronova SubInterp** | **216,517** | **204,636** | **0.92ms** | **53 MB** |
+| 4 | Pyronova GIL | 100,673 | 97,727 | 2.56ms | 17 MB |
+| 5 | Robyn --fast (22 processes) | 76,504 | 76,051 | 29.62ms | 420 MB |
+
+The headline: a Python web server at **216,517 req/s**, sitting third, brushing against two pure-Rust servers that have no interpreter in the loop at all.
+
+## Where the overhead actually goes
+
+Rankings are fun; ratios are the real story. Because Pyronova is built on the same stack as Axum (Tokio + Hyper + matchit ≈ Axum), the Pyronova-vs-Axum comparison is nearly apples-to-apples — the *only* material difference is that Pyronova hands each request to a CPython handler and Axum doesn't. That delta is the Python tax, measured directly.
+
+| Comparison | GET / | GET /hello | Meaning |
+|------|-------|-----------|------|
+| Pyronova SubInterp vs Axum (same stack) | 96.7% | 92.6% | Python only costs 3-7% |
+| Pyronova SubInterp vs Actix | 95.8% | 98.0% | Nearly on par with pure Rust |
+| Pyronova GIL vs Axum | 45.0% | 44.2% | Single GIL cuts performance in half |
+| Robyn --fast vs Actix (same stack) | 33.8% | 36.4% | Loses 2/3 of performance |
+
+Two rows carry the entire argument.
+
+**Row one:** SubInterp reaches 96.7% and 92.6% of the identical Rust stack. The Python interpreter — dispatching a route, constructing a request object, running a handler, serializing a response — costs **3 to 7 percent**. Not 10×. Not 2×. Single-digit percent.
+
+**Row three:** the *same* Python handler, run under a single shared GIL, collapses to ~45% of Axum. Nothing changed about the Python. The route is the same, the handler is the same, the object allocations are the same. The only variable is whether the interpreter's lock is shared across cores or replicated per-core. Sharing it **halves** throughput.
+
+That's the whole thesis in one table. The cost of Python-the-language is 3-7%. The cost of Python-the-GIL is 55%. When people say "Python is slow for servers," they are almost always measuring the second number and blaming the first.
+
+> **Pyronova is open source.** If a Python server at 97% of pure Rust interests you, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Why the GIL is the villain, not the interpreter
+
+CPython bytecode is not fast, but it is fast *enough* that for an I/O-shaped web workload — parse a request, touch a dict, format a response — the interpreter time is dwarfed by everything else. The problem has never been that a single handler is slow. The problem is that a single process can only run **one** handler's Python at a time, no matter how many cores you bought.
+
+The industry's usual escape hatch is to fork the whole process N times: N OS processes, N interpreters, N copies of everything. Robyn's `--fast` mode does exactly this — 22 processes here. And it works, in the sense that it uses multiple cores. But look at what it costs:
+
+- **Throughput:** Robyn's Actix backend can do 226k req/s bare (it's the same Actix in row one). Through 22 Python processes it delivers 76k — it keeps only ~34% of its own engine. The Python layer, forked across processes, costs it two-thirds of that performance.
+- **Memory:** 420 MB of RSS versus Pyronova's 53 MB. Twenty-two full interpreters, twenty-two copies of your imported modules, twenty-two heaps. Sub-interpreters share the process's read-only code segments and loaded `.so` files; only the Python heap and GIL state are per-interpreter, so the marginal cost of the Nth worker is roughly the size of its live objects, not a fresh CPython.
+- **Latency:** 29.62ms average versus 0.92ms. The tail is where a saturated fixed process pool with head-of-line blocking really shows.
+
+Same fast Rust core, two ways to reach the cores. Fork the process and you keep a third of your engine at 8× the memory. Multiply the GIL inside one process and you keep 97% at a fraction of the memory.
+
+## The honest caveats
+
+A benchmark this clean is clean *because* it's narrow, and it would be dishonest to oversell it:
+
+- **These handlers are trivial by design.** A route that runs a heavy pure-Python loop, or a big `numpy` reduction, will spend real time in the interpreter, and there the language cost stops being 3-7%. This measurement isolates *framework* overhead — it is not a claim that Python computes as fast as Rust.
+- **Pure Rust still wins outright on the plaintext ceiling.** Axum and Actix are ahead on every row, and on the simplest possible response that lead is real and undefeatable. Sub-interpreters get you *close to* the ceiling; they don't move it.
+- **macOS loopback has its own ceiling.** These numbers are near the physical limit of this test rig, which is why the top three cluster so tightly. On Linux the whole board shifts up — that's a different post.
+- **The 53 MB isn't free either.** It's dramatically better than 420 MB, but it's more than the 14 MB of bare Axum. Ten live interpreters cost something; that something is just small and shared.
+
+## The takeaway
+
+If you've been avoiding Python in your request path on the assumption that the interpreter is the bottleneck, the assumption is stale. On the same Rust stack, the interpreter costs 3-7%. The lock costs 55%. Give every core its own interpreter and its own lock, and a Python web server lands at **93-97% of pure Rust** — with an ecosystem the Rust server will never have.
+
+The Python layer can be very thin indeed. You just have to stop making every core wait in the same line.

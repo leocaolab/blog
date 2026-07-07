@@ -1,0 +1,97 @@
+---
+title: "From God file to eight modules (and RAII for raw pointers)"
+description: "Hardening a raw-FFI proof of concept: RAII for CPython's reference counts, a crossbeam worker pool that kills head-of-line blocking, and splitting a 981-line God file into eight modules — with zero regression."
+date: 2026-07-07
+tags: [rust, python, architecture, performance, sub-interpreters, benchmarks]
+series: "pyre"
+seriesOrder: 11
+draft: false
+---
+
+Every fast thing starts as a dangerous thing. When you're proving that N CPython sub-interpreters in one Rust process can actually serve traffic, you write the shortest code that makes the benchmark move. You hold raw `*mut PyObject` pointers. You call `Py_INCREF` and `Py_DECREF` by hand. You round-robin requests across a fixed pool behind a mutex. And it works — the PoC hit its throughput number and proved the thesis.
+
+Then you have to ship it. This post is about the pass that turned a working-but-scary raw-FFI proof of concept into something with edges you can hold: RAII for reference counts, a channel-based worker pool, and an 8-module split of a 981-line God file. The constraint was the interesting part — **all of it had to be zero-regression**, and we have the benchmark to prove it was.
+
+## The inherited hazard list
+
+The PoC left a specific set of landmines. Written down honestly, they sorted by blast radius:
+
+| Problem | Risk | Fix |
+|------|---------|------|
+| Raw `*mut PyObject` pointers | High | `PyObjRef` RAII wrapper, `Drop` auto-DECREFs |
+| Manual `Py_INCREF` / `Py_DECREF` | High | Safe `from_owned` / `from_borrowed` / `into_raw` API |
+| Script filtering by string matching | Medium | Python `ast.parse` + `ast.unparse` |
+| No `Py_EndInterpreter` cleanup | Medium | Auto `Py_EndInterpreter` on worker exit |
+| Head-of-line blocking (round-robin + mutex) | High | `crossbeam-channel` multi-consumer pool |
+| Static-file path traversal | High | `trim_start_matches('/')` + `..` detection |
+| Middleware corrupting binary responses | Medium | Non-UTF-8 bodies use `PyBytes`, not lossy string coercion |
+
+Three of these are worth walking through, because each one is a general lesson about living below a garbage-collected runtime.
+
+## RAII for a foreign runtime's reference counts
+
+CPython's memory model is manual reference counting. Every `PyObject*` you receive is either **owned** (you're responsible for one decref) or **borrowed** (you must not decref). Get this wrong in one direction and you leak; get it wrong in the other and you free an object CPython is still using, which is a use-after-free waiting to crash a production process under load.
+
+Hand-written `Py_INCREF`/`Py_DECREF` pairs are exactly the kind of thing that's correct the day you write it and wrong three edits later, when someone adds an early `return` between the incref and the decref. Rust has a native answer to "this resource must be released on every exit path": RAII. So the fix was a wrapper type, `PyObjRef`, that owns the pointer and decrefs in `Drop`:
+
+- `from_owned` — takes ownership of a pointer that already carries a reference (the common case for C-API calls that return "new references").
+- `from_borrowed` — increfs first, so the wrapper owns its *own* reference independent of the borrow.
+- `into_raw` — hands the raw pointer back out when you deliberately need to pass ownership across the FFI boundary.
+
+Now every early return, every `?`, every panic unwinds through `Drop` and the refcount balances itself. The important measured result: **this abstraction costs nothing we could measure.** In the benchmark the RAII wrapper added no detectable overhead versus the hand-written pairs — most likely because the compiler inlines the `Drop` into the same `Py_DECREF` the manual code would have emitted. You get the safety of a scope guard and, as far as the numbers can tell, pay nothing for it.
+
+## The mutex was the throughput ceiling, not the safety net
+
+The PoC dispatched requests with a round-robin index and a per-worker `Mutex`. It's the obvious first thing to write, and it has a nasty failure mode: **head-of-line blocking**. If request #7 lands on worker 3 and happens to be slow, every subsequent request assigned to worker 3 waits behind it — even if workers 0, 1, and 2 are sitting idle. Round-robin assigns work *before* it knows how long the work will take, so one slow request stalls a whole lane.
+
+The fix is to stop assigning and start pulling. A `crossbeam-channel` becomes a single work queue that every worker consumes from; whichever worker is free grabs the next request. Responses come back through a `tokio::sync::oneshot`, so the Tokio task awaiting the result never blocks a thread. Slow requests now only occupy the one worker actually running them; the rest of the pool keeps draining the queue.
+
+There's a subtlety worth stating plainly: this is not a strict speedup. Threading a request through a channel (crossbeam send + oneshot await) is one more layer of indirection than grabbing a mutex you were assigned. So on the *best case* — every request identically trivial — the channel is slightly slower. We measured that cost and accepted it, because the best case is not the case that pages you at 3am. You trade a few percent on uniform load to delete a pathological tail on mixed load. That is almost always the right trade for a server.
+
+> **Pyronova is open source.** If wrapping RAII around raw CPython refcounts is your kind of problem, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Parsing Python with Python
+
+One small fix has an outsized elegance. The engine needs to filter the user's handler script — it injects and strips certain definitions before running it in a sub-interpreter. The PoC did this by matching lines as strings, which is exactly as brittle as it sounds: a decorator on its own line, a multi-line signature, an unusual bit of whitespace, and the string matcher quietly does the wrong thing.
+
+Python ships an `ast` module. So instead of pattern-matching source text, the engine now runs `ast.parse` to get a real syntax tree, transforms *that*, and `ast.unparse`s it back to code. It understands decorators because it understands the grammar. When you're already embedding CPython, the correct parser for Python is the one sitting in the process with you.
+
+## Breaking up the God file
+
+The PoC lived in two files, and `lib.rs` had grown to **981 lines** — routing, request types, JSON serialization, response building, GIL and sub-interpreter handlers, static-file serving, and app lifecycle, all in one scroll. That's fine for a prototype and miserable for a codebase you want other people to touch. We split it along responsibility lines into eight modules (plus the safety layer):
+
+```
+src/
+├── lib.rs          18 lines   ← #[pymodule] + mod declarations
+├── types.rs       116 lines   ← Request, Response, extract_headers
+├── json.rs         44 lines   ← py_to_json_value (Rust-side JSON)
+├── router.rs       70 lines   ← RouteTable, SharedRoutes
+├── response.rs    164 lines   ← extract_response_data, build/error/404
+├── handlers.rs    218 lines   ← handle_request (GIL) + subinterp
+├── static_fs.rs    69 lines   ← try_static_file, mime_from_ext
+├── app.rs         342 lines   ← PyronovaApp, run_gil(), run_subinterp()
+└── interp.rs      820 lines   ← PyObjRef RAII, channel pool, AST filter
+```
+
+Nothing here is exotic. It's boring, and boring is the goal — you can now find the response logic without reading past the router. The one non-obvious payoff showed up in the numbers.
+
+## Zero regression — with a bonus
+
+The whole point of a hardening pass is that behavior doesn't change. We re-ran the full benchmark (macOS ARM64, Python 3.14.3, Rust 1.93.1, wrk 4.2.0, `wrk -t4 -c256 -d10s`) against the pre-refactor build:
+
+| Metric | v0.3.0 (mutex) | v0.3.1 (channel) | Change |
+|------|-------------|-----------------|------|
+| SubInterp GET `/` | 223,440 | 215,429 | −3.6% |
+| SubInterp GET `/hello` | 223,545 | 212,602 | −4.9% |
+| SubInterp GET `/search` | 221,787 | 215,200 | −3.0% |
+| GIL GET `/` | 100,386 | 103,587 | **+3.2%** |
+| GIL GET `/hello` | 93,616 | 98,359 | **+5.1%** |
+| GIL GET `/search` | 85,581 | 96,600 | **+12.9%** |
+
+The sub-interpreter path gave back ~3-5% — precisely the channel-indirection cost we predicted and signed off on, in exchange for killing head-of-line blocking. The RAII wrapper and the security fixes (path-traversal defense, `PyBytes` binary preservation) cost **nothing** measurable; they're zero-cost abstractions or trim operations on the cold path.
+
+The surprise is the GIL column: **+3% to +13%**, and the modular split is the only change that could plausibly account for it. Breaking the 981-line file into focused compilation units may have handed the compiler smaller, cleaner functions to optimize, and the search route — the heaviest of the three — improved most. We didn't confirm the mechanism with asm or a profiler, so treat it as a likely explanation rather than a proven one. But we didn't refactor for speed. We refactored for sanity and got speed as a side effect.
+
+## What generalizes
+
+Three things carry beyond this one server. First: when you drop below a managed runtime, *rebuild its guarantees as types* — RAII made CPython's refcount contract a compiler concern instead of a code-review concern, for free. Second: dispatch policy is a latency decision, not just a throughput one — pulling from a queue beats pushing to an assignment, and a small average-case cost is cheap insurance against a bad tail. Third: cleaning up structure is not cosmetic — smaller functions may give the compiler more room to optimize, and "zero regression" turned out to mean "slightly faster where it counted."

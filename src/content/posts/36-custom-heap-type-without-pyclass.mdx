@@ -1,0 +1,167 @@
+---
+title: "Building a custom heap type when #[pyclass] isn't allowed"
+description: "PyO3's #[pyclass] hard-rejects sub-interpreters, so we built our request object from the raw CPython C-API — and learned three heap-type invariants the hard way."
+date: 2026-07-07
+tags: [rust, python, pyo3, sub-interpreters, memory, gc]
+series: "pyre"
+seriesOrder: 36
+draft: false
+---
+
+If you write Rust that talks to Python, you reach for PyO3, and you define
+Python-visible objects with `#[pyclass]`. It's the whole point of the library:
+you write a Rust struct, annotate it, and PyO3 generates a correct CPython heap
+type — `tp_new`, `tp_dealloc`, GC hooks, the works. You almost never think about
+the type object underneath.
+
+Then you try to run inside a sub-interpreter, and PyO3 stops you at the door:
+
+```
+pyclass ... cannot be used with sub-interpreters
+```
+
+PyO3 0.28 **hard-rejects** sub-interpreters. Not "discouraged," not "untested" —
+it aborts. And it's right to. A `#[pyclass]`'s type object and its associated
+state are effectively process-global, and sub-interpreters demand per-interpreter
+type state. PyO3 refuses rather than hand you a footgun.
+
+For Pyronova — a Rust server hosting N CPython sub-interpreters, one per core,
+each with its own GIL — that's a problem, because the object we hand every
+handler is a request object. It needs to be a real Python type, with attributes
+and helper methods, and it gets constructed and destroyed on the hot path,
+hundreds of thousands of times a second. No `#[pyclass]` allowed.
+
+So we built it from the raw C-API. Here's what that actually takes, and the
+three invariants that cost us real debugging time to learn.
+
+## The shape of a hand-rolled heap type
+
+You describe a heap type to CPython with a `PyType_Spec`: a name, a basic size,
+a set of flags, and a slot table pointing at your C functions. `PyType_FromSpec`
+turns that into a live type object. Instead of PyO3 generating this, you write
+it:
+
+```rust
+static SLOTS: &[ffi::PyType_Slot] = &[
+    ffi::PyType_Slot { slot: ffi::Py_tp_dealloc, pfunc: request_dealloc as _ },
+    ffi::PyType_Slot { slot: ffi::Py_tp_members, pfunc: MEMBERS.as_ptr() as _ },
+    ffi::PyType_Slot { slot: 0, pfunc: null_mut() },
+];
+
+static SPEC: ffi::PyType_Spec = ffi::PyType_Spec {
+    name: c"pyronova._Request".as_ptr(),
+    basicsize: size_of::<RequestObject>() as i32,
+    itemsize: 0,
+    flags: ffi::Py_TPFLAGS_DEFAULT as u32,   // note what's NOT here
+    slots: SLOTS.as_ptr() as *mut _,
+};
+```
+
+The seven request fields — method, path, params, query, body, headers, client
+IP — are declared as `PyMemberDef` entries so CPython exposes them as attributes
+with zero per-access glue. The object's C struct is `PyObject_HEAD` followed by
+seven `*mut PyObject` slots.
+
+The critical piece is `tp_dealloc`. With `#[pyclass]` gone, nobody frees your
+slots for you. You write it, and you make it synchronous and total:
+
+```rust
+unsafe extern "C" fn request_dealloc(obj: *mut ffi::PyObject) {
+    let this = obj as *mut RequestObject;
+    // DECREF all seven slot pointers, right here, deterministically.
+    for slot in (*this).slots_mut() {
+        ffi::Py_XDECREF(*slot);
+        *slot = null_mut();
+    }
+    let tp = ffi::Py_TYPE(obj);
+    let free = ffi::PyType_GetSlot(tp, ffi::Py_tp_free);
+    transmute::<_, extern "C" fn(*mut c_void)>(free)(obj as _);
+    ffi::Py_DECREF(tp as *mut ffi::PyObject); // heap types are refcounted
+}
+```
+
+That's the freedom the raw C-API buys you: a `tp_dealloc` that decrements every
+field the instant the object dies, on the thread that's holding the GIL right
+now. No deferral, no reliance on CPython's sub-interpreter finalization path —
+which, as we found elsewhere in this series, you cannot count on.
+
+## Invariant 1: no `Py_TPFLAGS_BASETYPE`
+
+The obvious instinct is to make the type subclassable — set `Py_TPFLAGS_BASETYPE`
+so users can extend `_Request`. We tried it, and the leak came back.
+
+With the flag set and the subclass path exercised, our per-instance dealloc count
+dropped to zero — the seven slots stopped getting decref'd even though the
+`tp_dealloc` slot was wired correctly, and the RSS line regained its slope.
+Destruction of a subclass instance runs through CPython's generic
+`subtype_dealloc` rather than landing straight in the dealloc we wrote, and
+exactly how that path composes with a hand-rolled heap-type dealloc is subtle
+enough — and CPython-version-specific enough — that we didn't chase it to the
+root. The tested invariant is simpler than the diagnosis: keep the type final,
+no `BASETYPE`, and don't inherit through it.
+
+So: no `BASETYPE`. The type is final. But handlers still need `.text()`,
+`.json()`, `.body`, `.query_params`. Those get **monkey-patched onto the heap
+type** at sub-interpreter init — attached as methods after the type is built,
+per interpreter, rather than exposed through a subclassable base. Slightly
+unusual, entirely deliberate.
+
+> **Pyronova is open source.** The hand-rolled heap type and the rest of the FFI layer are on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). Star it if this level of CPython plumbing is your thing, or pull it down with `pip install pyronova`.
+
+## Invariant 2: no `Py_TPFLAGS_HAVE_GC`
+
+This one an external reviewer flagged as a *bug*. CPython's own guidance (see
+the gh-116946 discussion) says a container type holding references to other
+objects should set `Py_TPFLAGS_HAVE_GC` and implement `tp_traverse` / `tp_clear`
+so the cyclic garbage collector can find and break reference cycles through it.
+Our `_Request` holds seven object references. By the book, it's a GC type.
+
+We enabled it, benchmarked it, and it made things **measurably worse** — the
+per-request leak jumped from ~63 B/req to ~313 B/req under 400k rps sustained
+load. Five times worse.
+
+The reason the book didn't apply: gh-116946's concern is *finalize-time cycle
+collection*. It matters when your objects can participate in reference cycles
+that only the cyclic GC can break. Our request object cannot. It's built in
+Rust, its seven slots point at leaf values (strings, bytes, plain dicts), it
+lives for exactly one request, and nothing ever makes it point back at itself.
+There are no cycles. So GC tracking is pure cost: every instance gets threaded
+onto the per-interpreter GC list on creation and unthreaded on death, every
+collection cycle traverses objects that can never be garbage, and none of it can
+ever reclaim a thing — because there's nothing cyclic to reclaim.
+
+The lesson: "this type holds references, therefore it needs GC" is a shape-match,
+not a proof. GC earns its overhead only when cycles are *possible*. Measure the
+workload; don't apply the rule reflexively. We documented the reasoning in the
+type's source header so the next person doesn't "fix" it back.
+
+## Invariant 3: per-interpreter type state
+
+The reason PyO3 slammed the door in the first place. A `#[pyclass]` builds one
+type object, effectively process-wide. Under sub-interpreters that's a bug
+waiting to happen: a type object created in interpreter A, its refcounts touched
+from interpreter B, its state shared across GIL domains that are supposed to be
+isolated.
+
+The raw C-API path sidesteps it by construction. Each sub-interpreter runs
+`PyType_FromSpec` **itself**, at its own init, producing its **own** `_Request`
+type object living in its own heap with its own refcount bookkeeping. There is
+no shared type object to race on. The heap type is refcounted per interpreter,
+and its instances are created and destroyed entirely within the interpreter that
+owns them — which is exactly the isolation guarantee sub-interpreters are
+supposed to give you, made real instead of assumed.
+
+## The tradeoff, stated plainly
+
+Going raw C-API means you own things PyO3 would have owned for you: the type
+spec, the member table, the dealloc, the per-interpreter lifecycle, and the
+knowledge of which flags are landmines. It is more code and more ways to shoot
+yourself.
+
+What you get back is a request object with a **deterministic** destructor that
+runs on the right thread under the right GIL, no cyclic-GC overhead on an object
+that has no cycles, and true per-interpreter type isolation — none of which PyO3
+0.28 will give you inside a sub-interpreter at any price. When you're building
+on the frontier of what CPython supports, the high-level abstraction isn't
+available, and the C-API stops being legacy trivia and becomes the tool you
+actually need.

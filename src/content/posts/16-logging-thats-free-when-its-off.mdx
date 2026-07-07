@@ -1,0 +1,150 @@
+---
+title: "Logging that's free when it's off"
+description: "Three tracing targets, a Python-to-Rust FFI logging bridge, and a design that costs a single branch when disabled — measured at 1.6% for a full access log and 9.5% for per-request user logs."
+date: 2026-07-07
+tags: [python, rust, performance, benchmarks, sub-interpreters, http]
+series: "pyre"
+seriesOrder: 16
+draft: false
+---
+
+Logging is where fast servers go to die. The default `logging.StreamHandler` in
+CPython does a synchronous `write()` to stderr while holding the GIL. At a couple
+hundred thousand requests a second, that lock plus that syscall on the hot path will
+quietly erase most of what you built. So the question for a server that tops out
+around 214k req/s isn't "how do we log" — it's "how do we log without giving the
+throughput back."
+
+The answer rests on two rules: **all log I/O sinks to Rust** — Python never touches
+stderr for logs — and **it costs nothing when it's off.** Not "cheap." Nothing: a
+single atomic load and a branch the CPU predicts correctly every time.
+
+## Three targets, so you pay only for what you want
+
+Logs are not one stream. Pyronova splits them into three `tracing` targets, each
+independently filterable:
+
+| Target | Carries | Source |
+|--------|---------|--------|
+| `pyronova::server` | Startup, shutdown, watchdog alerts, connection/WS errors | Rust |
+| `pyronova::access` | Per-request: method, path, status, latency_us, mode | Rust |
+| `pyronova::app` | User `logging.*` calls, with worker id + file:line | Python → Rust FFI |
+
+```
+INFO  pyronova::server  Pyronova started version="1.2.0" mode="hybrid" addr=127.0.0.1:8000
+INFO  pyronova::access  Request handled method=GET path=/ status=200 latency_us=198 mode="subinterp"
+INFO  pyronova::app     Fetching users from DB worker=3 logger=myapp file=app.py line=42
+```
+
+Splitting them matters because their costs differ by an order of magnitude. Server
+logs are rare. Access logs fire once per request but stay entirely in Rust. App logs
+cross the language boundary. Being able to switch on the access log while leaving the
+Python bridge off — or the reverse — means you never pay for a channel you're not
+reading. The `access_log` flag maps to a `pyronova::access=off` filter directive; the
+rest of the pipeline doesn't notice.
+
+## The zero-cost claim, and why it holds
+
+Everything routes through the `tracing` macros, and `tracing` with an `EnvFilter`
+compiles a disabled log site down to an atomic level-check. When the level is `OFF` or
+the message is filtered out, there is no string formatting, no allocation, no syscall —
+one atomic load, one branch, and the branch predictor is at 100% after warmup. The
+message arguments are never even evaluated.
+
+Claims like "zero-cost" deserve a benchmark, not a promise. Same JSON endpoint, four
+logging configurations, `wrk` at 100 connections for 10 seconds:
+
+| Config | Throughput | P99 | Overhead |
+|--------|-----------:|----:|---------:|
+| OFF (baseline) | 214,420 | 1.25ms | — |
+| ERROR (prod default) | 214,484 | 1.56ms | −0.0% |
+| ACCESS (full access log) | 210,991 | 1.43ms | −1.6% |
+| USER_LOG (access + per-request user log) | 194,068 | 2.23ms | −9.5% |
+
+Read the top two rows first. `OFF` and `ERROR` are throughput-identical — 214,420 vs
+214,484, a difference under 0.1% that is pure `wrk` noise. That is the zero-cost claim,
+measured: turning logging from fully off to production-default (errors only) changes
+nothing, because every `info!`/`access!` site that doesn't fire is just that predicted
+branch.
+
+> **Pyronova is open source.** If logging that costs a single predicted branch when
+> it's off sounds like your kind of trade-off, ⭐
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) on GitHub — or
+> `pip install pyronova` and flip the log flags yourself.
+
+## Access logging for 1.6%
+
+The `ACCESS` row is the interesting one: **every** request now emits a structured line
+— method, path, status, latency in microseconds, execution mode — at 210k req/s, and it
+costs **1.6% throughput and +0.18ms at P99** (1.25ms → 1.43ms). One log line per
+request, at that rate, for essentially free.
+
+That comes from the appender. Pyronova uses `tracing-appender`'s `non_blocking` layer:
+the Tokio worker threads that handle requests only push the formatted event onto a
+lock-free MPSC channel and move on. A single dedicated background thread owns the
+actual write to stdout. The request path never takes a `StdoutLock`, never blocks on a
+syscall, and the async reactor never starves waiting for I/O. The write happens, it
+just happens somewhere the request will never wait for it.
+
+## The Python bridge, and what it actually costs
+
+The last row is where Python re-enters. `USER_LOG` adds a `logging.info()` call inside
+every handler — the app-log target — and throughput drops to 194,068 (−9.5%) with P99
+climbing to 2.23ms. This is the one that isn't free, and the reason is honest: it's
+Python.
+
+To bridge it, Pyronova hijacks the root logger in the main interpreter *and* every
+sub-interpreter with a handler whose `emit()` calls straight into Rust:
+
+```python
+class _PyronovaRustHandler(logging.Handler):
+    def emit(self, record):
+        _pyronova_emit_log(              # C-FFI → Rust
+            record.levelname,
+            record.name,
+            record.getMessage(),
+            record.pathname or "",
+            record.lineno or 0,
+            self._worker_id,
+        )
+```
+
+There is a subtlety the sub-interpreters force. They can't import a PyO3 extension
+module, so `_pyronova_emit_log` can't be a normal PyO3 function there. Instead it's
+registered as a C-FFI built-in — the same mechanism the workers already use for their
+send/receive channel — injected into each sub-interpreter's globals before bootstrap
+runs. Same bridge, two registration paths, one Rust sink.
+
+The cost model, per log site:
+
+| Scenario | Cost |
+|----------|------|
+| `level=OFF`, or filtered out | ~1ns (atomic compare, predicted branch) |
+| Log accepted, Rust side | ~50–100ns (FFI crossing + tracing format) |
+| Python `logger.info("msg")` | ~200ns (`getMessage()` + FFI) |
+
+That ~200ns is what the 9.5% is made of: one extra in-GIL Python operation per request,
+`getMessage()` plus the FFI hop, and under queue pressure that serialized work shows up
+in the tail — P90 alone jumps from 606µs to 722µs. It's a real cost and the benchmark
+shows it plainly rather than hiding it.
+
+But scale sets the honest frame. Even in the heaviest configuration — two log lines per
+request, full access log *plus* a user log — the server holds 194k req/s at 2.23ms P99.
+Memory stayed flat across all four configs (147–156 MB for the full ten-worker
+sub-interpreter process on the M4 rig) with zero errors under load.
+
+## The recommendation that falls out
+
+| Use case | Config | Throughput |
+|----------|--------|-----------:|
+| Benchmarking / ultra-low latency | `level=OFF` | 218k (100%) |
+| Production, errors only | `level=ERROR` | 215k (98%) |
+| Production, full audit trail | `level=INFO, access_log=True` | 211k (96%) |
+| Development / debug | `debug=True` + user logging | 195k (89%) |
+
+The shape of that table is the whole point. Off costs nothing, so leave the log sites
+in. A full audit access log costs 1.6%, so run it in production without a second
+thought. The only meaningful bill comes from routing high-frequency application logs
+through Python on the hot path — and that bill is 9.5%, visible, and yours to opt into.
+Logging shouldn't force a choice between observability and speed. Structure it so the
+off switch is genuinely free, and it doesn't.

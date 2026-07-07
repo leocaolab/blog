@@ -1,0 +1,155 @@
+---
+title: "An adversarial auditor and 31 'bugs'"
+date: 2026-07-07
+description: "How to triage an adversarial code audit that lands at a 68% signal rate: grep current-versus-stale source, cross-reference the runtime it cites, measure the memory claims, and know when to stop."
+tags: [debugging, architecture, python, rust]
+series: "pyre"
+seriesOrder: 37
+draft: false
+---
+
+We handed Pyronova's source to an external reviewer and asked it to be
+adversarial — to hunt for bugs the way a formal-verification pass would, seven
+sweeps over the code, no benefit of the doubt. It came back with **31 claimed
+bugs**.
+
+Thirty-one findings is exactly the kind of report that ruins a week if you
+handle it badly. Treat every claim as true and you spend days "fixing"
+non-problems, sometimes making the code worse. Treat every claim as noise and
+you'll wave away the real ones — and an adversarial reviewer, precisely because
+it doesn't care about being polite or right, surfaces real bugs a friendly
+review never would.
+
+This post is about the triage discipline, not the bugs. Pyronova is a Rust
+server hosting N CPython sub-interpreters, so the specifics get gnarly, but the
+method generalizes to any audit you didn't write and can't fully trust.
+
+## The headline number: 68% signal
+
+Of the 31 claims, 21 held up and 10 did not. A **68% signal rate**.
+
+That number is the most useful thing to compute first, and the most useful thing
+to internalize about adversarial tooling: it is *useful but not
+self-certifying*. Two-thirds real means you cannot skip verification (you'd ship
+a third of your effort as noise), and it also means you cannot skip *reading*
+(you'd throw away two-thirds of genuine findings). There is no shortcut. Every
+single claim has to be individually adjudicated. The score just tells you the
+report is worth adjudicating.
+
+The interesting engineering is in *how* the ten false positives failed, because
+each failure mode is a filter you can build and reuse.
+
+## Filter 1: grep the *current* source, not the source it read
+
+The single most common failure: the reviewer cited code that no longer existed.
+
+Pyronova had recently moved its request-construction path from one design to
+another. The old path built an argument array and freed each element by hand.
+The new path transfers owned references directly into the allocator and never
+touches an argument array. The reviewer confidently flagged a **double-free** in
+the hand-freeing loop.
+
+The loop was real. It just hadn't been in the tree for weeks. The audit was
+pattern-matching against a shape it had seen earlier in the same session, from
+before the rewrite. `git log` on the file and a grep for the loop it described
+settled it in under a minute: stale code, rejected.
+
+This happened repeatedly — the reviewer kept re-flagging idioms from the
+pre-rewrite design. So it became the *first* gate for every finding: **grep the
+claim against `HEAD` before thinking about whether it's true.** A large fraction
+of adversarial findings die here, instantly, on a fact rather than a judgment
+call. Do this filter first and cheaply and you save your actual attention for
+claims that are at least about code you still ship.
+
+## Filter 2: cross-reference the runtime it's reasoning about
+
+The claims that survive the grep are about real, current code — and the next
+batch fails on a different axis. The reviewer reasons about how a *runtime*
+behaves, and gets the runtime wrong.
+
+Two examples, both rejected on the same principle.
+
+One claim was that a WebSocket handler calling `Python::attach` on a freshly
+spawned OS thread would cross a PEP 684 boundary and land in the wrong
+sub-interpreter. Reading the actual code, WebSocket handlers are registered in
+the *main* interpreter — the decorator runs at import time, in main — so
+`attach` on a new thread binds to main's own thread-state. It matches; no
+sub-interpreter is ever reached. The claim described a plausible boundary
+violation attached to the wrong interpreter.
+
+Another asserted that a background fetch call blocked the asyncio event loop.
+The code ran that call on a dedicated fetcher thread and scheduled results back
+onto the loop via the standard threadsafe primitive — the loop is *never*
+blocked. The reviewer saw a blocking-shaped call and assumed a blocking-shaped
+consequence without tracing which thread it ran on.
+
+> **Pyronova is open source.** Every one of those 31 bugs was fixed in the open — see for yourself on GitHub at [leocaolab/pyronova](https://github.com/leocaolab/pyronova). A ⭐ is welcome, and `pip install pyronova` gets you the audited build.
+
+When a claim depends on language internals, you cross-reference the *primary
+source* — CPython's own source, not the reviewer's model of it, and not your
+own memory of it. One finding insisted our type had to opt into cyclic garbage
+collection per an upstream CPython issue. Reading that issue showed its concern
+was finalize-time *cycle* collection; our object can't form cycles, so the rule
+didn't apply — and a measurement (below) proved enabling it made things worse.
+Another finding rested on a claim about how CPython's dict deallocator defers
+work; reading `Objects/dictobject.c` for the version we actually ship showed the
+deferral mechanism it named wasn't used there at all. Both rejected — not on
+opinion, but by reading the file the claim was really about.
+
+The rule: **a claim about a runtime is a claim about a specific file in that
+runtime's source. Open the file.** Pattern-matching, at any level of
+sophistication, catches the *shape* of a bug class. It cannot tell you what this
+code, on this version, on this thread, actually does.
+
+## Filter 3: measure the claims that are shaped like performance
+
+A distinct class of finding is neither stale nor mis-modeled — it's a
+performance or memory assertion that *sounds* right and can only be settled on a
+scale. "Enable this flag, save allocations." "This copy costs you twice."
+
+You don't argue these. You benchmark them. Our most instructive false positive
+was the cyclic-GC claim from Filter 2: the theory was clean, the citation was
+real, and enabling the flag made the per-request leak **five times worse** under
+sustained load. If we'd accepted it on the strength of its reasoning we'd have
+shipped a regression that looked like a fix. A separate "this saves N bytes per
+request" claim measured out to be within run-to-run noise — technically
+defensible, practically nothing.
+
+**Memory- and perf-shaped claims get a number or they don't get merged.** The
+reviewer's confidence is not evidence; the benchmark is.
+
+## When to stop
+
+Triaging 31 findings, the temptation is to fix everything real in one heroic
+pass. Resist it. Of the 21 real findings, plenty were correctness and hygiene
+fixes worth landing immediately — C-API re-entrancy, error-return checks,
+URL-decoding, TOCTOU on a file open, graceful-shutdown races. Those went in.
+
+But several *real* findings pointed at genuine architectural gaps whose correct
+fix is a non-trivial redesign, not a patch. Forcing a rushed fix on a real bug
+whose proper solution is a refactor is its own kind of damage — you get a fragile
+workaround that has to be unwound later. The disciplined move is to accept the
+finding, record *why* it isn't fixed yet and what the real fix requires, and
+defer it explicitly. "Accepted, deferred, here's the shape of the real fix" is a
+legitimate and honest triage outcome. A validated bug you've consciously chosen
+not to patch today is in far better shape than a bug you've papered over.
+
+## The method, distilled
+
+1. **Score it.** Compute the signal rate. It tells you the report is worth
+   reading; it does not certify any single claim.
+2. **Grep first.** Kill stale-code claims against `HEAD` before you reason about
+   them. Cheapest filter, highest yield.
+3. **Read the source it's reasoning about.** Runtime claims are file claims —
+   open the file, on the version you actually ship, and trace the thread.
+4. **Measure the perf claims.** A number beats the reviewer's confidence and
+   beats your own intuition.
+5. **Stop deliberately.** Land the patches, *defer* the redesigns with reasons.
+   Don't rush a workaround onto a bug that deserves a refactor.
+
+An adversarial auditor is a genuinely good instrument. It found us real bugs a
+courteous review would have glided past. But a 68% signal rate is a
+collaboration, not an oracle. The tool finds the *shape* of the bug. Confirming
+what the code does today, and what reality measures, is still the engineer's job
+— and it's the only step that turns 31 claims into 21 fixes without shipping the
+other ten.

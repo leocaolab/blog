@@ -1,0 +1,107 @@
+---
+title: "Two engines, three route types: sync, async, and gil=True"
+description: "One decorator, three destinations. How a sub-interpreter web server auto-dispatches def, async def, and gil=True routes — and what each one costs in throughput and memory."
+date: 2026-07-07
+tags: [python, architecture, async, gil, sub-interpreters, memory]
+series: "pyre"
+seriesOrder: 12
+draft: false
+---
+
+Most Python web frameworks give you one execution model and ask you to bend your workload to fit it. If it's async-first, your CPU-bound handler blocks the event loop. If it's sync-first, your database call ties up a worker for the whole round-trip. And if you need a C extension like `numpy`, you're on your own to figure out why it won't import.
+
+Pyronova runs N CPython sub-interpreters in one process — each with its own GIL under PEP 684 — plus a main interpreter and an async engine. That's more than one place a handler can run, which raises an obvious design question: **who decides where each route goes?** The answer is the framework, from a signal you're already writing. You don't pick an engine. You write a handler, and the shape of the handler routes it.
+
+## Three ways to write a handler, zero config to run them
+
+Here is the entire contract:
+
+```python
+@app.get("/fast")
+def fast(req):              # → sync pool (220k req/s)
+    return "hello"
+
+@app.get("/io")
+async def io_heavy(req):    # → async pool (133k req/s)
+    await asyncio.sleep(0.1)
+    return "done"
+
+@app.get("/numpy", gil=True)
+def compute(req):           # → main interpreter, GIL (numpy works)
+    import numpy as np
+    return {"mean": float(np.mean([1, 2, 3]))}
+
+app.run()                   # auto-detects, auto-dispatches, zero config
+```
+
+Three routes, three destinations, one `app.run()`. The framework inspects each handler at registration: a plain `def` goes to the sub-interpreter sync pool, an `async def` goes to the async pool, and the explicit `gil=True` flag pins the route to the main interpreter. On startup it tells you exactly how it split the work:
+
+```
+  Pyronova v1.0.0 [hybrid-async mode]
+  Workers: 5 sync + 5 async
+  Routes: 2 sub-interp + 0 GIL + 1 async
+```
+
+No `mode=` argument to guess at, no config file to maintain. The dispatch decision is derived from the code, at the source, where the person who knows the workload already expressed its shape by choosing `def` or `async def`.
+
+## What each route type is actually for
+
+The three engines exist because three workloads want three different things.
+
+| How you write it | Routes to | Throughput | Use it for |
+|------|--------|------|---------|
+| `def handler(req)` | sync worker pool | **220k req/s** | APIs, JSON, computation |
+| `async def handler(req)` | async worker pool | **133k req/s** | databases, network I/O, `await` |
+| `@app.get(gil=True)` | main interpreter (GIL) | **50-80k req/s** | numpy, C extensions |
+
+**`def` → sub-interpreter sync pool.** This is the default and the fast path. Each request is handed to a sub-interpreter that owns its own GIL, so N cores run N handlers with zero lock contention between them. If your route parses JSON, looks something up, does some pure-Python work, and returns — this is where you want it, at full throughput.
+
+**`async def` → async engine.** A database query or an outbound HTTP call spends almost all its wall-clock time waiting, not computing. Pinning a whole sub-interpreter to that wait would be wasteful — one worker, one in-flight query. The async engine instead runs an asyncio event loop that suspends on every `await` and juggles thousands of in-flight coroutines on one thread. You give up raw req/s (133k vs 220k) and buy real I/O concurrency, which is exactly the right trade when the bottleneck is the network, not the CPU.
+
+**`gil=True` → main interpreter.** Some libraries — `numpy` is the canonical one — use process-global C state that refuses to initialize more than once per process, so they simply won't load in a sub-interpreter. This is a CPython ecosystem limitation, not a framework choice. The escape hatch is `gil=True`: the route runs on the main interpreter, under the classic single GIL, where those extensions work normally. It's the slowest lane, but it's a lane, and it runs on `spawn_blocking` so a heavy `numpy` reduction there never stalls the sync or async pools.
+
+The rule of thumb the docs give is blunt and useful: if `pip show <package>` lists a `.so` or `.pyd` file, it probably needs `gil=True`; pure-Python packages always work in sub-interpreters.
+
+> **Pyronova is open source.** If one decorator dispatching to three engines appeals to you, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The isolation guarantee
+
+The reason auto-dispatch is safe to lean on is that the three engines don't interfere with each other:
+
+- `def` handlers always take the sync pool — **220k req/s, no loss**, regardless of what other routes exist.
+- `async def` handlers always take the async pool — **133k req/s of genuinely concurrent I/O**.
+- The two share nothing. Independent channels feed independent worker pools, so a flood of slow `async` requests can't starve your fast `def` routes, and vice versa.
+- `gil=True` routes go through `spawn_blocking`, so even a CPU-heavy C-extension call can't block either pool.
+
+That last point matters more than it looks. The failure mode of a single-engine async framework is one badly-behaved synchronous handler freezing the loop for everyone. Here, the badly-behaved handler is quarantined to its own lane by construction. You can mix all three route types in one app and reason about each one in isolation.
+
+## The memory model: why one process beats N processes
+
+The other half of the design is memory, and this is where the sub-interpreter bet pays off against the usual alternative — forking N OS processes. Each additional sub-interpreter costs roughly **~10 MB**, because most of a Python process is shared and only a little is per-interpreter:
+
+| Workers | Pyronova SubInterp | Robyn (multiprocess) |
+|---------|---------------|-------------|
+| 1 | 31 MB | ~20 MB |
+| 10 | 119 MB | 447 MB |
+| 32 | 333 MB | ~660 MB |
+
+(This is a scaling table from the developer-experience docs — a separate run from the ~67 MB peak measured in the head-to-head throughput benchmark, so read the shape of the curve rather than any single cell against other posts. The `~660 MB` 32-worker Robyn figure is an extrapolation, hence the tilde.)
+
+At one worker the multiprocess model is actually leaner — a single OS process has less bookkeeping than an embedded interpreter host. But watch what happens as you scale. Ten multiprocess workers cost 447 MB; ten sub-interpreters cost 119 MB. The curves diverge because of what's shared versus copied:
+
+- **Shared across all workers:** the CPython core code, the Rust binary, and the read-only code segments of every loaded `.so`. A C extension's `.so` is `mmap`ed **once** for the whole process — 32 sub-interpreters amortize a single copy.
+- **Not shared:** the Python heap (module dicts, your objects) and each interpreter's GIL state.
+
+So the marginal worker costs about what its live Python objects weigh, not a fresh CPython install. Fork the process N times and you pay for N of everything — N interpreters, N copies of every imported module, N heaps. On a memory-constrained box that's the difference between fitting your worker count and swapping.
+
+## The honest edges
+
+This model is opinionated, and the opinions have costs worth naming:
+
+- **`gil=True` is a real bottleneck, not a footnote.** It's the 50-80k lane on a single shared GIL. If your app is numpy-heavy on every route, you're mostly running the slow lane, and a forked-process design that gives each process its own numpy will out-parallelize you on that specific workload — until those libraries adopt PEP 684 per-interpreter support. It's an ecosystem gap, and the honest framing is that it's a gap, not a win.
+- **`async def` costs throughput on purpose.** 133k is lower than 220k because the async engine trades peak req/s for I/O concurrency. If your `async` handler doesn't actually `await` anything meaningful, you've picked the slower lane for no benefit — write it `def`.
+- **The 220k / 133k / 50-80k figures are shape-dependent.** They're the ceiling for light handlers on this class of machine; a heavy handler spends its time in your code, not the framework, and the numbers move accordingly.
+
+## The point
+
+The design goal was to make the fast thing the default thing. You write `def` and you're on the 220k sub-interpreter path without asking for it. You write `async def` when you have I/O to overlap, and you reach for `gil=True` only when a C extension forces your hand. Three engines, one decorator, and a dispatch decision that comes from the code you were going to write anyway — with a memory curve that stays flat while the multiprocess alternative climbs.

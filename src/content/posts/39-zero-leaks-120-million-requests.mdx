@@ -1,0 +1,91 @@
+---
+title: "Zero leaks, 120 million requests: proving stability"
+description: "Burst benchmarks measure throughput; soak tests measure whether you leak. Here's how a Python-in-Rust server survives 120 million requests with flat RSS — and the regression gate that keeps it that way."
+date: 2026-07-07
+tags: [python, rust, memory, gil, sub-interpreters, benchmarks]
+series: "pyre"
+seriesOrder: 39
+draft: false
+---
+
+A 10-second benchmark tells you how fast a server *can* go. It tells you nothing about whether it will still be alive in an hour. Those are different questions, and for a server built the way Pyronova is, the second one is the scary one.
+
+Pyronova runs N CPython sub-interpreters in one process, each with its own GIL under PEP 684, dispatched from a Tokio runtime over crossbeam channels. That architecture lives or dies on reference counting. Every request crosses a thread boundary carrying Python objects. A single `Py_INCREF` without its matching `Py_DECREF` doesn't crash — it leaks maybe 50–100 bytes, quietly, forever. At a few hundred thousand requests per second, even *ten* bytes per request is megabytes a minute. A leak that would take a day to notice in production shows up in five minutes if you point enough load at it. So we do.
+
+## The arithmetic of a leak
+
+Here's why soak testing catches what unit tests can't. Suppose a handler path leaks 10 bytes per request. Harmless-looking. Now run it at 214,000 requests per second:
+
+```
+10 bytes/req × 214,000 req/s = 2.1 MB/s = ~630 MB in five minutes
+```
+
+A flat memory curve under that load isn't a nice-to-have — it's a *proof*. If RSS holds steady across tens of millions of requests, there is no unmatched refcount on the hot path, full stop. You cannot fake that number; the allocator either grows or it doesn't.
+
+So the stability test is simple in shape: pick a load, hold it for a long time, and watch RSS. We've run this on two machines across the project's life. One note before the numbers: a later post in this series documents a cross-thread `PyThreadState` leak that lived in Pyronova's per-request attach/detach path — a worker thread attaching and detaching a sub-interpreter thread-state it didn't create — which was fixed in v1.5.0. The soak runs below measured baseline stability on the hot path they exercised; they don't contradict that finding, and it doesn't undercut them. Read what follows as evidence that the path these runs drove held flat across tens of millions of requests.
+
+## 90 million requests, and RSS that never grew
+
+The first serious soak ran on an Apple M4 (10 cores), Python 3.14.3, Pyronova in sub-interpreter mode with 10 workers, driven by `wrk` at 4 threads / 100 connections. Phase 1 was five minutes of sustained hello-world:
+
+| Metric | Value |
+|---|---|
+| Duration | 300 seconds |
+| Total requests | 64,410,189 |
+| Requests/sec | 214,641 |
+| Avg latency | 0.383 ms |
+| Non-2xx responses | 0 |
+| Socket errors | 0 |
+
+Then three more phases — path params, JSON POST, a CPU-bound `fib(10)` route — a minute each, pushing the cumulative total past 90 million requests. The memory behavior is the part worth dwelling on: RSS held flat for the entire run. It didn't climb, drift, or step up between phases — the same resident set at 90-plus million requests as at the start, zero growth across the whole soak.
+
+Zero Non-2xx, zero socket errors, all four endpoints correct afterward, server still alive. That's three things proven at once: the `PyObjRef` RAII wrapper (Drop auto-DECREFs) closes the refcount loop, mimalloc absorbs 90 million alloc/free cycles without fragmenting, and the bounded channel never overflowed into a single 503.
+
+> **Pyronova is open source.** The soak harness and the regression gate that keeps RSS flat are on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). If a flat memory line under load earns a ⭐ from you, we'd take it — or just `pip install pyronova`.
+
+## 120 million requests on Linux
+
+macOS loopback flatlines throughput early, so the real sustained-QPS number came from Linux — an 8-core Ryzen 7 7840HS, 16 workers plus 16 I/O workers, where SO_REUSEPORT multi-accept and kernel load balancing actually kick in. Phase 3 of that run was 300 seconds of continuous load on `GET /`:
+
+| Metric | Value |
+|---|---|
+| Duration | 300 seconds |
+| QPS (average) | 400,683 req/s |
+| Total requests | 120,209,758 |
+| P50 / P99 | 199 μs / 586 μs |
+| Non-2xx responses | 0 |
+| Socket errors | 0 |
+| Memory (start → after 300s) | 168.9 MB → 195.6 MB |
+| Memory growth | +26.7 MB |
+
+**120 million requests in five minutes, zero errors, at nearly double the throughput of the macOS run.** RSS grew 27 MB over the whole run — that's roughly 0.2 bytes per request, which is allocator arena drift, not a leak. (A real leak at this rate would have added hundreds of megabytes; see the arithmetic above.) And when the same server was slammed with 1,024 concurrent connections, it still held 356,328 req/s with zero errors — degradation, not collapse.
+
+## Turning a soak test into a gate
+
+Passing a soak test once is an anecdote. The interesting engineering is making sure a *future* commit can't quietly reintroduce a leak — because the whole point is that leaks are invisible until they aren't.
+
+So per-request RSS growth is now a hard, enforced gate: **200 bytes per request**, checked in the memory-regression suite on every change. During a later audit — after five new features landed (compression, TLS, upload streaming, async Postgres, CRUD helpers) — we re-measured against that gate on two payloads:
+
+```
+Plain JSON  (no compression, no TLS)
+  9,020,359 requests over 30 s at 300,477 rps
+  RSS growth: 1,036 KB → 0.12 B/req
+
+TLS + brotli (both enabled, same payload)
+  2,745,166 requests over 30 s at 91,376 rps
+  RSS growth: 8,628 KB → 3.14 B/req
+```
+
+The plain path sits at 0.12 B/req — effectively on the allocator-noise floor. The heaviest stack we ship, TLS plus brotli, runs at 3.1 B/req, which reflects transient allocator pressure from per-request brotli encoder buffers rather than a monotonic climb. Even that worst case leaves **60× of headroom** under the 200 B/req gate. And the nine-test memory-regression suite — cookie handling, header dicts not accumulating, sub-interpreter finalizers firing, bounded per-request growth, sustained concurrent load — passed 9/9 with no xfails, no skips, no soft-passes.
+
+That last detail matters more than it looks. It's easy to make a red test green by loosening the assertion; a "leak test" that's been quietly relaxed is worse than no test, because it *reports* safety it isn't checking. The gate only means something if it stays honest.
+
+## What sustained load actually proves
+
+Burst benchmarks are a photograph; soak tests are a movie, and the movie is where the bodies are buried. Three numbers, held under scrutiny:
+
+- **90+ million requests, macOS, RSS dead flat — zero growth** — the refcount discipline is real.
+- **120 million requests, Linux, 400k req/s, +27 MB** — this path scales sustained without leaking (the cross-thread-`PyThreadState` leak fixed in v1.5.0 lived on a different path; this soak measured baseline stability).
+- **A 200 B/req gate with 60× headroom** — and the discipline is now automated, not aspirational.
+
+For an architecture that hand-manages CPython reference counts across thread boundaries — the exact thing that's supposed to be too dangerous to attempt — the strongest defense isn't an argument. It's a flat line under 120 million requests.

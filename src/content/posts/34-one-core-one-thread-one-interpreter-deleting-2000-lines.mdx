@@ -1,0 +1,174 @@
+---
+title: "One core, one thread, one interpreter: deleting 2,000 lines"
+description: "The Thread-Per-Core rewrite: SO_REUSEPORT becomes the entire load balancer, ~2,000 lines of work-stealing and sharding get deleted, and a slow handler is contained by defense in depth instead of a scheduler."
+date: 2026-07-07
+tags: [rust, architecture, performance, linux, sub-interpreters, http]
+series: "pyre"
+seriesOrder: 34
+draft: false
+---
+
+The best code review outcome is a red diff. After concluding that a work-stealing
+dispatcher would burn a large fraction of its time budget on cross-die atomic
+traffic it could never benefit from — the load balancer coordinating work that was
+pinned and couldn't move anyway — the fix wasn't a cleverer scheduler. It was
+deleting the scheduler. This is the Thread-Per-Core (TPC) re-architecture: an
+estimated ~2,000 lines removed, and a design where the Linux kernel *is* the load
+balancer.
+
+## The shape
+
+Pyronova runs N CPython sub-interpreters in one process for per-core Python
+parallelism (PEP 684). The old design put a tokio multi-threaded runtime, a
+shared worker pool, and a sharded dispatch layer between the accept loop and
+those interpreters. TPC collapses the entire stack into one unit, replicated per
+core:
+
+```
+                    :8080
+             ┌────────┴────────┐
+             │   Linux kernel  │  SO_REUSEPORT hash on (src_ip, src_port)
+             │   accept-hash   │
+             └─┬───┬───┬─────┬─┘
+               │   │   │     │
+   ╔═══════════╪═══╪═══╪═════╪════════════╗
+   ║  Core 0   ║ 1 ║ 2 ║ ... ║ Core N-1   ║
+   ║ listener  │   │   │     │  listener  ║  ← TcpListener bound SO_REUSEPORT
+   ║ current-  │   │   │     │  current-  ║  ← new_current_thread() runtime
+   ║ thread rt │   │   │     │  thread rt ║
+   ║ sub-      │   │   │     │  sub-      ║  ← Py_NewInterpreter(), lives forever
+   ║ interp    │   │   │     │  interp    ║
+   ╚══════════╩════╩════╩═════╩════════════╝
+```
+
+One OS thread per physical core, pinned with `core_affinity`. Each thread does,
+in order:
+
+1. Owns its own `TcpListener` bound with **`SO_REUSEPORT`**. The kernel
+   distributes new connections across the listeners via a 4-tuple hash, so each
+   thread's accept queue is independent and contention-free.
+2. Runs a `tokio::runtime::Builder::new_current_thread()` — a single-threaded
+   executor. No work-stealing, because there's nothing to steal to.
+3. Hosts a sub-interpreter created once at startup via `Py_NewInterpreter()`.
+   The `PyThreadState` is created, attached, and *never crosses threads*.
+4. Handles accept → parse → call handler → send response **sequentially** on
+   that one thread.
+
+The key move: **`SO_REUSEPORT` is the entire load balancer.** There is no
+application-level dispatch. The kernel already load-balances new TCP connections
+across listeners; the old design was re-implementing that in userspace, badly,
+with atomics. Delete the userspace version and let the kernel do the job it was
+built for. Every cross-CCD atomic probe from the old P2C dispatcher simply
+ceases to exist, because there's no probe — the work arrives on the core the
+kernel routed it to and never leaves.
+
+## What gets deleted
+
+This is the satisfying part. An entire vocabulary of concurrency machinery
+becomes dead code:
+
+| Subsystem | What goes |
+|---|---|
+| Work dispatch | `InterpreterPool::submit`/`new`, all sharding state, P2C probing, shard capacity constants |
+| Channels | per-worker `crossbeam_channel` queues for the sync and async pools |
+| Admission | the shared `tokio::sync::Semaphore`, replaced by a per-thread local counter |
+| Cross-pool theft | pool-id stamping, cross-pool guards, the zombie-timeout watchdog — *physically impossible* under TPC, because work can't leave its thread |
+| tstate rebinding | `rebind_tstate_to_current_thread` — the interpreter stays put forever |
+| Dual pool | separate sync + async worker pools; an `async def` handler becomes an ordinary `spawn_local` task on the same thread's runtime |
+
+Estimated total: **~2,000 lines deleted**, mostly from the dispatch core. A large
+class of bugs goes with them. The zombie-worker guards, the pool-id cookie
+matching, the cross-thread `PyThreadState` rebinding — every one of those existed
+to police work moving between threads. When work can't move, you don't need
+guards; you need the absence of the thing being guarded. That's not defensive
+code you delete carefully. It's code that becomes *unreachable by construction*.
+
+What stays is the genuinely shared, genuinely cross-worker state: the one
+process-wide database pool (accessed via `Arc`, its C-FFI bridge unchanged), and
+`SharedState` (an `Arc<DashMap>` whose lock-freedom under 64 cores comes from
+DashMap's own internal sharding, independent of any dispatcher we write). Those
+are shared because they're *supposed* to be shared. Everything that was shared
+only to enable a scheduler we no longer have is gone.
+
+> **Pyronova is open source.** The leaner architecture — one core, one thread, one interpreter — lives on GitHub at [leocaolab/pyronova](https://github.com/leocaolab/pyronova). Star it if that model appeals to you, or try it with `pip install pyronova`.
+
+## The one thing TPC gives up
+
+Sequential-on-one-thread has a sharp edge, and pretending otherwise would be
+dishonest. If accept and handler run on the same thread, a slow synchronous
+handler — a 50 ms numpy call — freezes that core's accept loop for 50 ms.
+
+You cannot preempt Python without undefined behavior; there's no safe way to rip
+a running handler off a core mid-execution. So TPC doesn't try. It contains the
+damage with defense in depth — three independent layers, none of which pretends
+to stop a slow handler, all of which limit its blast radius.
+
+**Line 1 — a per-core watchdog.** Each TPC thread stamps a monotonic timestamp
+before entering Python and zeros it on exit. A separate monitor thread sweeps
+every few milliseconds and logs a loud warning when any core's handler has been
+running past a threshold, naming the offending core and route:
+
+```rust
+// on the TPC thread, around the handler call:
+TPC_LAST_TICK[core_id].store(now_ns(), Ordering::Release);
+let resp = run_python_handler(req);
+TPC_LAST_TICK[core_id].store(0, Ordering::Release);
+
+// on the monitor thread:
+if now_ns() - TPC_LAST_TICK[core_id].load(Ordering::Acquire) > threshold_ns {
+    tracing::warn!(core = core_id,
+        "TPC core blocked — slow sync handler; use async def or blocking=True");
+}
+```
+
+Two relaxed stores per request and one relaxed load per core per sweep —
+negligible. Its whole job is to make the slow handler impossible to ignore: it
+names and shames until you fix it.
+
+**Line 2 — a `blocking=True` escape hatch.** When you *know* a route is heavy,
+you say so, and it runs on tokio's blocking pool instead of a TPC core:
+
+```python
+@app.get("/heavy", blocking=True)
+def heavy(req):
+    slow_sync_numpy_stuff()   # runs off the accept loop
+    return {...}
+```
+
+The TPC thread hands the work off and immediately returns to accepting. The
+watchdog from Line 1 exists precisely to push users toward this flag.
+
+**Line 3 — a per-request timeout.** Every handler call is wrapped in a timeout.
+On expiry: respond 504, log the freeze. The interpreter keeps running the
+zombie code (again, no safe preemption), but the client doesn't hang, and — this
+is the payoff of the whole architecture — `SO_REUSEPORT` re-hashes *new*
+connections to other cores whose accept queues aren't stuck. One frozen core is
+not a down cluster. The kernel routes around it for free.
+
+Notably, this is not a *worse* failure mode than before. In the old pool, a slow
+handler blocked its pool worker just the same. TPC makes the boundary explicit —
+one slow handler blocks exactly one core — and the kernel's connection hashing
+turns that into graceful degradation instead of a stall.
+
+## What's shipping, and what's roadmap
+
+The re-architecture lands in phases, each a separate revertible PR: TPC accept
+layer behind a flag, then per-thread sub-interpreters, then the `gil=True`
+bridge to a single main-interpreter thread over one MPSC channel (the cold path
+for legacy C extensions), then the big deletion of the old pool.
+
+One piece is explicitly *future*, not done: **NUMA-aware pinning.** On a
+multi-CCD box, the ideal is to pin TPC thread N to the specific die its
+`SO_REUSEPORT` hash targets, building a topology map from
+`/sys/devices/system/node/`. That's the direct answer to the cross-die problem
+that started this whole rewrite — but it requires validation on real NUMA
+hardware and is deliberately deferred until the core TPC design proves out.
+io_uring, HTTP/3, and NUMA topology tuning are all out of scope for this
+iteration; the goal here is feature parity with the old server minus two thousand
+lines of dispatch.
+
+The through-line: the fastest dispatcher is no dispatcher. Once the compute work
+is pinned to a core by construction — one sub-interpreter that can't move — every
+layer built to move work between cores is not just overhead, it's overhead you're
+paying to fight your own design. Deleting it isn't a simplification you settle
+for. It's the architecture the hardware was asking for the whole time.

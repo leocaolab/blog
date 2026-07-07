@@ -1,0 +1,69 @@
+---
+title: "Head-to-head with Actix: where Python wins and where it can't"
+description: "The honest full-matrix HTTP Arena comparison of a Python web server against Actix-web 4 — a 13× static-file win, a 4.6× compressed-JSON win, and the four profiles where pure Rust simply beats us."
+date: 2026-07-07
+tags: [python, rust, performance, benchmarks, http, architecture]
+series: "pyre"
+seriesOrder: 38
+draft: false
+---
+
+Most framework benchmarks are marketing. Someone picks the one profile where they win, prints the ratio in a big font, and hopes you don't ask about the rest of the matrix. So let me start this one with the losses.
+
+Pyronova is a Rust HTTP server (Tokio + Hyper + matchit) that runs N CPython sub-interpreters in one process, each with its own GIL under PEP 684. Every request gets dispatched into a real Python handler. Actix-web 4 is pure Rust — its handler is a native future with no interpreter anywhere in the loop. We ran both through HTTP Arena's own `gcannon`-based lite driver, the full profile matrix, on an 8-core-class machine (AMD Ryzen 7 7840HS, 8C/16T). Same box, both images in Docker, three 5-second runs per profile, best of three.
+
+Here is the whole board. Nothing hidden.
+
+| Profile | Pyronova rps | Actix rps | Winner |
+|---|--:|--:|---|
+| baseline | 501,071 | 844,068 | Actix 1.68× |
+| pipelined | 450,723 | 4,725,017 | Actix 10.48× |
+| limited-conn | 324,621 | 556,571 | Actix 1.71× |
+| json | 140,917 | 361,728 | Actix 2.57× |
+| **json-comp** | **113,366** | 24,544 | **Pyronova 4.62×** |
+| upload | 1,305 | 2,227 | Actix 1.71× |
+| async-db | 7,212 | 46,109 | Actix 6.39× |
+| **static** | **60,604** | 4,591 | **Pyronova 13.20×** |
+| baseline-h2 | 486,616 | 1,125,542 | Actix 2.31× |
+| **static-h2** | **36,201** | 6,063 | **Pyronova 5.97×** |
+
+Actix wins seven of ten. We win three. If you were hoping for a clean sweep, this isn't it — and that's exactly the point.
+
+## Where Actix wins, and why it should
+
+The losses are not bugs. They are the Rust-versus-Python asymmetry showing through honestly.
+
+On **baseline** plaintext, Actix does 844k rps to our 501k — a 1.68× gap. On **pipelined** it does 4.7M to our 450k, a 10.48× blowout. That pipelined number is where the gap is widest, and the reason is structural: pipelining makes the per-request work as cheap as it can possibly be, which means the fixed cost of crossing into a Python handler is proportionally *largest*. Actix's pipeline handler is a pure-Rust function returning a cached response. Ours dispatches into CPython on every single request. There is no clever fix for that without deleting the entire reason Pyronova exists — the handler being Python *is* the value proposition. We accept the loss.
+
+**json** (2.57×) and **async-db** (6.39×) tell the same story from different angles. The JSON path spends real time constructing a Python dict and serializing it; Actix serializes a Rust struct. And async-db is our weakest showing for an honest architectural reason: our Postgres pool serializes DB waits per worker — one in-flight query per sub-interpreter at a time — while Actix keeps many queries in flight per core. That's a real limitation of the current design, not a tuning miss. One harness note, the same caveat that applies to json-comp: Arena's async-db profile runs a heavier payload and higher concurrency than the `wrk` harness we used elsewhere in this series, which clocked the same path at ~27k rps — so the 7,212 here reflects Arena's profile, not a regression against that number.
+
+> **Pyronova is open source.** Want to rerun the matrix yourself? It's all on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). Star it if real Python-handler throughput is worth the trade, or install it with `pip install pyronova`.
+
+## Where Pyronova wins: static files
+
+The static-file result is the one that surprised us most, and it's worth understanding because it's not a fluke.
+
+On the **static** profile Pyronova serves 60,604 rps to Actix's 4,591 — **13.2×**. On HTTP/2 the ratio narrows to 5.97× but the memory story gets dramatic: serving the same static workload, Actix's RSS climbs to **52 GiB** while Pyronova peaks at 4.2 GiB. A 12× memory difference on a file-serving benchmark.
+
+Why does the Python server win the pure-Rust server here? Because on the static path, *neither* server runs Python — and Pyronova's static path is better engineered. `try_static_file` runs entirely in Rust on the Tokio async-fs backend, resolved before the handler dispatch ever happens. The request never reaches a sub-interpreter. Actix's `actix-files`, by contrast, appears to re-read the file from disk per request, and on the h2 profile holds file descriptors and chunk buffers until RAM balloons. The Python-versus-Rust framing is a red herring here: static serving is a Rust-versus-Rust contest that we happen to have tuned harder.
+
+## Where Pyronova wins: compressed JSON
+
+The **json-comp** win is real but it comes with an asterisk I want to be upfront about.
+
+We serve 113,366 rps of compressed JSON to Actix's 24,544 — **4.62×**. The mechanism is not magic: Actix's `Compress` middleware doesn't expose compression-level tuning, and we do. We ran with gzip level 1 and brotli quality 0 — the cheapest settings — because under Arena's heavy-concurrency mixed-payload profile the compression *throughput* matters far more than squeezing out the last few percent of ratio. Any deployment can reproduce this; it's a configuration lever any server *should* expose, and we're faster because we let you pull it.
+
+The asterisk: this profile went from 7,151 rps to 113,366 rps once we set those levels — a 16× jump from one config change. And our own earlier `wrk`-based benchmark on the same machine showed a much narrower 1.5× edge on compressed JSON. Arena's concurrency-512 profile with smaller payloads magnifies the gap in our favor; a different harness would report a different number. I trust the 4.62× on *this* harness, but I wouldn't stake a general "Pyronova compresses 4.6× faster than Actix everywhere" claim on it. The honest version is: on Arena's compressed-JSON profile, with level tuning Actix can't do, we're 4.6× ahead.
+
+## Reading the whole board
+
+Strip away the profile-by-profile detail and the shape is simple:
+
+- **When the request path touches Python, Actix wins.** Baseline, pipelined, json, async-db, upload, and both h2 baselines all go to Rust. The gap tracks how cheap the request is — cheapest requests, biggest gap.
+- **When the request path *doesn't* touch Python, it's a Rust-vs-Rust fight, and our plumbing is competitive or better.** Static files and level-tuned compression are wins on engineering, not on language.
+
+That's the credible story, and it's more useful than a sweep would have been. A pure-Rust server will out-throughput a Python-in-the-loop server on the hot path — that was never in doubt, and pretending otherwise would just make the wins look like cheating. What Pyronova actually buys you is 500k rps of *real Python handler dispatch* on 8 cores in a single process, with a static-file and compression story that holds its own against Rust, and the entire Python ecosystem available inside the handler. If your workload is "serve a cached byte string as fast as electrically possible," use Actix. If it's "run Python business logic on every request without paying the multiprocess tax," the 1.68× you give up on baseline is a bargain.
+
+A few honest gaps remain on this run. The `json-tls` profile never recorded — the bench script kept crashing the Docker daemon during its tuning phase, so that cell is a genuine TODO rather than a number we're hiding. The upload profile is slow (1,305 rps) and was memory-heavy until we wired streaming into the sub-interpreter path, which dropped RAM from 3.1 GiB to 1.7 GiB for a 20% throughput bump — better, still 1.7× behind Actix, still on the list. And async-db stays 6× down until the pool learns to keep multiple queries in flight per worker, which is an API-breaking change we haven't shipped.
+
+None of that is comfortable to write. All of it is true, which is the only reason the 13× is worth believing.

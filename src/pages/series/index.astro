@@ -1,0 +1,30 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro"
+import { getSeriesList } from "../../lib/series.ts"
+
+const series = await getSeriesList()
+---
+
+<BaseLayout
+  title="Series"
+  description="Multi-part series — deep dives meant to be read start to finish."
+>
+  <div class="intro">
+    <h1>Series</h1>
+    <p class="muted">Multi-part deep dives, meant to be read in order.</p>
+  </div>
+
+  {series.length === 0 && <p class="muted">No series yet.</p>}
+
+  <ul class="post-list">
+    {
+      series.map((s) => (
+        <li>
+          <a href={`/series/${s.slug}/`}>{s.title}</a>
+          <span class="series-count">{s.count} parts</span>
+          <p class="muted">{s.description}</p>
+        </li>
+      ))
+    }
+  </ul>
+</BaseLayout>

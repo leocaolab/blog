@@ -1,0 +1,112 @@
+---
+title: "Turning the async bridge inside-out"
+description: "Sub-interpreter I/O was stuck at 8k req/s because Rust was driving Python. Flip it so Python drives the async loop and the same workload hits 133k — past Robyn's 92k."
+date: 2026-07-07
+tags: [python, rust, async, sub-interpreters, gil, benchmarks]
+series: "pyre"
+seriesOrder: 13
+draft: false
+---
+
+Pyronova's sub-interpreter path is fast at CPU-bound work — 200k+ req/s of JSON and routing, one interpreter per core, no shared GIL. But for a while it had an embarrassing hole: a handler that did nothing but `await asyncio.sleep(1ms)` — the canonical stand-in for a database query or an outbound API call — topped out around **8k req/s**. A Python competitor, Robyn, did the same workload at ~86k. On the one thing async is supposed to be good at, we were an order of magnitude behind.
+
+The fix wasn't a faster anything. It was flipping the direction of control between Rust and Python. This is the story of turning the async bridge inside-out.
+
+## Why sleep(1ms) capped at 8k
+
+The original model had Rust in charge. Each worker was an OS thread that pulled a request off a channel, acquired the sub-interpreter's GIL, called the Python handler, and — crucially — ran the coroutine to completion synchronously before moving on:
+
+```
+Rust worker thread → recv(request) → acquire GIL → Python handler()
+  → run_until_complete(coro) → block for 1ms → release GIL → send(response)
+  → recv(next request)
+```
+
+`run_until_complete` is a **blocking** call. While a worker sits inside that 1ms sleep, its entire OS thread is parked — it cannot touch a second request. So each worker is strictly serial, and the math is brutal:
+
+```
+10 workers × (1000 req/s per worker) = 10,000 req/s theoretical ceiling
+measured: 7,892 ≈ physically pinned to the wall
+```
+
+Ten threads, ten concurrent requests, full stop. Adding cores wouldn't help much — you'd need thousands of OS threads to get thousands of concurrent 1ms sleeps, and that's not a design, that's a fork bomb.
+
+## Why Robyn wasn't
+
+Robyn hit ~86k on this workload in the runs that first set our target — the final head-to-head below measured it a touch higher, at 92k — because it doesn't run one coroutine per thread. It runs an `async def` handler on a native asyncio event loop, and a single event loop can suspend thousands of `await asyncio.sleep` calls at once. The OS thread underneath never blocks; the coroutines are parked and resumed in user space. That's the entire point of asyncio, and our Rust-drives-Python model was throwing it away by blocking the driver thread on every single request.
+
+The lesson was uncomfortable but clear: to get asyncio's concurrency, you have to let asyncio actually *run the loop*. You can't keep Rust in the driver's seat and call into Python one blocking coroutine at a time.
+
+## The flip: Python drives, Rust feeds
+
+So we inverted it. Instead of a Rust thread that calls Python and waits, the worker becomes a Python asyncio loop that pulls its own work from Rust and never blocks:
+
+```
+Rust channel → pyronova_recv() → Python asyncio loop
+                                  ↓
+                             create_task(handler(req))
+                             create_task(handler(req))   ← thousands concurrent
+                             create_task(handler(req))
+                                  ↓
+                             await sleep(1ms)   ← suspends, thread stays free
+                                  ↓
+                             pyronova_send(req_id, response) → Rust oneshot
+```
+
+Now `await` does what it's meant to: it suspends the coroutine and hands the thread back to the loop, which immediately starts (or resumes) another request. One thread juggles thousands of in-flight sleeps. Rust's job shrinks to feeding requests in and collecting responses out. Three pieces make it work.
+
+**A request registry on the Rust side.** Every incoming request gets a unique `req_id` and its `oneshot::Sender` is stashed in a `response_map`. When Python finishes a request it calls back with that `req_id`, and Rust uses it to wake the correct Tokio task. This is what lets responses come back **out of order** — request #900 can finish before request #5, and each still finds its way home.
+
+**Two C-FFI bridge functions, injected into each sub-interpreter.** `pyronova_recv(worker_id)` pulls the next request, and `pyronova_send(worker_id, req_id, ...)` returns a response. The subtle, load-bearing detail is in `recv`:
+
+```rust
+let saved = ffi::PyEval_SaveThread();   // release the GIL
+let req = state.rx.recv();               // block waiting — but holding no GIL
+ffi::PyEval_RestoreThread(saved);        // take the GIL back
+```
+
+If the fetcher blocked on `recv()` while holding the sub-interpreter's GIL, no coroutine could run during the wait — we'd have rebuilt the original stall. Releasing the GIL *before* blocking is the whole trick: the fetch waits idle while the asyncio loop keeps churning through tasks that already arrived.
+
+**A Python async engine that ties it together.** A background fetcher thread calls `pyronova_recv` (GIL released) and uses `loop.call_soon_threadsafe` to spawn each request as a task on the event loop. The handler runs, `await`s its I/O, and calls `pyronova_send` with the result:
+
+```python
+async def _process_request(req_id, handler_idx, method, path, query, body):
+    handler = globals()[HANDLER_NAMES[handler_idx]]
+    req = _Request(method, path, {}, query, body, {})
+    res = handler(req)
+    if asyncio.iscoroutine(res):
+        res = await res              # suspends the task, not the thread
+    _pyronova_send(WORKER_ID, req_id, 200, "text/plain", str(res))
+```
+
+The thread model tells the story. Before: 10 OS threads, concurrency = 10. After: 10 workers each running an asyncio loop plus a fetcher thread — 20 OS threads, concurrency in the **thousands**, because concurrency is now a count of suspended coroutines, not of parked threads.
+
+> **Pyronova is open source.** If letting Python drive the async loop intrigues you, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The number
+
+The design doc set a target of 70k+ — enough to catch Robyn. The measured result went further. On the head-to-head sleep(1ms) benchmark:
+
+| Scenario | Pyronova (Async) | Robyn | Result |
+|----------|------------------|-------|--------|
+| sleep(1ms) | **132,903** | 92,257 | ✅ 1.4× |
+
+From **~8k to 133k req/s** on the same workload and the same hardware — a ~16× jump — and past Robyn's 92k rather than merely matching it. The bottleneck was never the sleep, the network, or Python's speed. It was ten threads standing in ten lines. Delete the blocking, and one thread serves a stadium.
+
+That flip also unlocked the whole `async def` route type. Under the old blocking model, real async libraries like `asyncpg` were effectively unusable — every query pinned a worker for its full round-trip. Once the event loop actually runs inside the sub-interpreter, `await`-based ecosystem code works, and I/O-bound Python finally overlaps the way it was always supposed to.
+
+## Where it sits in the bigger picture
+
+This async engine is the middle lane of a three-lane design. CPU-bound `def` handlers still run on the sub-interpreter sync pool at peak throughput; `gil=True` routes run on the main interpreter for C extensions; and I/O-bound `async def` handlers ride this bridge. Zooming out to the whole comparison against Robyn:
+
+| Dimension | Pyronova | Robyn | Advantage |
+|-----------|----------|-------|-----------|
+| **CPU-bound** (Hello/fib/JSON) | 220k | 87k | 2.5× |
+| **I/O-bound** (sleep/async) | 133k | 92k | 1.4× |
+| **Memory** | 67 MB | 447 MB | 6.7× |
+
+The async win is the narrowest of the three margins, and that's worth stating honestly — 1.4× is a lead, not a blowout, and on pure I/O concurrency a mature asyncio server is a genuinely strong opponent. The point isn't that we crushed async; it's that the sub-interpreter architecture no longer *concedes* async. Before the flip it did, badly.
+
+## The takeaway
+
+When a fast runtime feels slow, check who's driving. We had Rust calling into Python and blocking on every coroutine, which quietly amputated the exact feature — cooperative suspension — that makes async worth using. Handing the loop back to Python, and being disciplined about releasing the GIL before any blocking wait, turned an 8k embarrassment into 133k. Same hardware, same handler. The concurrency was there the whole time; we'd just built a bridge that walked across it one person at a time.

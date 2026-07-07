@@ -1,0 +1,165 @@
+---
+title: "Adding features without losing throughput"
+description: "Four benchmark rounds proving that middleware, SharedState, async handlers, and SSE streaming all shipped with zero throughput regression."
+date: 2026-07-07
+tags: [python, performance, benchmarks, sub-interpreters, architecture]
+series: "pyre"
+seriesOrder: 17
+draft: false
+---
+
+There's a failure mode every framework eventually hits: the throughput number
+that looked great in the launch post quietly rots. A middleware hook here, a
+streaming type there, a shared-state map, an async path — each one lands with
+"negligible overhead," and six versions later you're 20% slower than you were
+and nobody can point at the commit that did it.
+
+Pyronova runs Python handlers across N CPython sub-interpreters, each with its
+own GIL (PEP 684), and the whole pitch rests on a single measured number:
+~215k req/s on the sub-interpreter hot path. That number is the product. So the
+discipline is simple and non-negotiable: **every feature ships with a
+regression benchmark, and if the hot path moves, we find out that round — not
+six versions later.**
+
+This is what that discipline actually looked like across four rounds of
+feature work.
+
+## Round 1: headers, query params, custom responses, middleware
+
+The v0.3.0 batch added the things a framework can't ship without: request
+header extraction, `query_params` parsing, a custom response type (status
+codes, headers, content-type), and `before_request` / `after_request`
+middleware hooks. Each one adds work to the per-request path. The question
+isn't "is it fast?" — it's "did the hot path move?"
+
+Test rig: macOS ARM64 (Apple Silicon), Python 3.14.3, Rust 1.93.1, wrk 4.2.0,
+`wrk -t4 -c256 -d10s`.
+
+| Route | Sub-interp req/s | Avg latency |
+|-------|-----------------|-------------|
+| GET `/` | 223,440 | 0.85 ms |
+| GET `/hello/{name}` | 223,545 | 0.85 ms |
+| GET `/search?q=` | 221,787 | 0.85 ms |
+
+The path-param route and the query-string route land within 1% of the bare
+route. Header extraction and query parsing are imperceptible on the
+sub-interpreter path. And against the previous version:
+
+| Metric | v0.2.0 | v0.3.0 | Change |
+|--------|--------|--------|--------|
+| SubInterp GET `/` | 216,517 | 223,440 | +3.2% |
+| SubInterp GET `/hello` | 204,636 | 223,545 | +9.2% |
+
+We *gained* throughput adding features — possibly the Rust compiler
+optimizing the refactored code better, not magic. But here's the honest part:
+middleware wasn't free everywhere. In GIL mode, the `after_request` hook cost
+~3% on `GET /` and ~10% on JSON routes, because `after_request` has to build a
+response object. That's a real, measured cost, on a specific path, and we wrote
+it down. Hiding it would have been the tell that the number can't be trusted.
+
+## Round 3: SharedState and async handlers
+
+Two rounds later, v0.5.0 landed three features at once — the exact scenario
+that breeds silent regressions:
+
+| Feature | What it adds to the hot path |
+|---------|------------------------------|
+| **async handler** | Auto-detect `async def` + bridge through `asyncio.run()` — one extra `PyCoro_CheckExact` per invocation |
+| **SharedState** | `Arc<DashMap>` cross-interpreter state via `app.state["key"]` — Arc refcounting, a larger app struct |
+| **Type stubs** | IDE autocomplete — zero runtime cost |
+
+Both runtime additions are constant-time: a coroutine type check and an atomic
+refcount bump. The theory says no measurable hot-path impact. The benchmark
+confirmed it:
+
+| Scenario | Round 2 | Round 3 | Change |
+|----------|---------|---------|--------|
+| Hello World | 211,019 | 216,297 | +2.5% |
+| JSON small | 212,521 | 214,185 | +0.8% |
+| JSON medium | 63,649 | 67,376 | +5.9% |
+| Parse 41B | 203,262 | 211,280 | +3.9% |
+| Parse 7KB | 90,867 | 96,400 | +6.1% |
+
+Zero regression, slight improvements across the board. Now the caveat, because
+the isolated feature numbers are where honesty earns its keep. SharedState's own
+read path tops out at 73,720 req/s (4.4 ms avg) — the SharedState post walks
+through why that 73k is spawn_blocking thread switching and GIL acquisition, *not*
+DashMap. And the async handler:
+
+```
+GET /async (asyncio.sleep 1ms, SubInterp mode):
+  8,007 req/s, 31.76ms avg latency
+```
+
+Each worker runs `asyncio.run()` serially: 10 workers × ~800 req/s = 8k. That's
+a real limitation, written down as a limitation, with the fix already named
+(the async-bridge rework in a later phase). A feature that's slow in isolation
+but doesn't touch the hot path is fine — as long as you say so.
+
+> **Pyronova is open source.** If a hot path that stays flat across four rounds of
+> feature work interests you, ⭐ the project at
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`
+> and run the regression suite.
+
+## Round 4: SSE streaming
+
+The last round added server-sent events for token streaming (AI agent output),
+which is architecturally the scariest addition of the four. To support both
+normal and streaming responses, *every* response now flows through a unified
+body type — an `Either<Full, StreamBody>`. That means every ordinary response
+picks up an extra `Either::Left` wrapper, and every response gets a type-name
+check to decide whether it's a stream.
+
+Adding a branch to the path that runs on 100% of requests to support a feature
+that runs on a fraction of them is exactly how hot paths die. So:
+
+| Scenario | Round 3 | Round 4 | Change |
+|----------|---------|---------|--------|
+| Hello World | 216,297 | 213,887 | -1.1% |
+| JSON small | 214,185 | 209,414 | -2.2% |
+| fib(10) | 187,340 | 206,179 | +10.1% |
+| Parse 41B | 211,280 | 205,675 | -2.7% |
+
+A wrapper enum and a string comparison are constant-time, and the numbers agree:
+everything sits inside normal run-to-run variance. Nothing broke.
+
+## The receipt: four rounds, one flat line
+
+The only way to prove a hot path didn't rot is to plot it across every round,
+not eyeball the latest run:
+
+| Scenario | R1 | R2 | R3 | R4 | Trend |
+|----------|----|----|----|----|-------|
+| SubInterp Hello | 219k | 211k | 216k | 214k | Stable ~215k |
+| GIL Hello | 119k | 78k | 81k | 83k | Stable ~80k |
+| GIL sleep(1ms) | 7.4k | 47k | 53k | 52k | Stable ~50k |
+| Hybrid Parse 41B | — | 208k | 214k | 210k | Stable ~210k |
+
+Two things jump out, and the second is the interesting one.
+
+The sub-interpreter hot path is a flat line at ~215k across four rounds of
+feature work — middleware, SharedState, async detection, and a universal
+streaming body wrapper all landed on it, and it didn't move. That's the whole
+point.
+
+The GIL-mode Hello line, though, drops from 119k to ~80k between R1 and R2 and
+stays there. That's **not** a feature regression — it's a deliberate
+architectural trade (moving GIL handlers onto `spawn_blocking`) that cost pure
+throughput to buy a 535% win on real I/O. It shows up on this chart as a step
+down, and pretending it wasn't there would undermine the entire exercise. A
+zero-regression chart is only credible if it also shows you the one place the
+number *did* move on purpose. That trade is worth its own post.
+
+## Why the discipline holds
+
+None of this is clever. There's no trick. The features are constant-time on the
+hot path because they were *designed* to be constant-time on the hot path — a
+type check, a refcount, a wrapper enum — and then the benchmark checked the
+design against reality every single round.
+
+The honest version of "zero regression" isn't "every number went up." Numbers
+went down inside variance, GIL middleware cost a measurable 3–10%, SharedState
+tops out at 73k on its own path, and async handlers do 8k until the bridge gets
+reworked. All of that is written down. What *didn't* move was the number the
+whole architecture is built to defend — and because we measured every round, we
+can prove exactly that, and nothing more than that.

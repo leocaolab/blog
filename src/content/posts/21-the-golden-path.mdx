@@ -1,0 +1,176 @@
+---
+title: "The Golden Path: msgspec, Polars, httpx over the C-extension stack"
+description: "Which Python libraries survive sub-interpreters, which ones segfault, and why the pure-Python stack is also the faster one."
+date: 2026-07-07
+tags: [python, sub-interpreters, performance, benchmarks, architecture]
+series: "pyre"
+seriesOrder: 21
+draft: false
+---
+
+Pyronova runs Python handlers across N CPython sub-interpreters in one process
+(PEP 684), each with its own GIL. That's true multi-core parallelism without the
+per-process memory tax of `multiprocessing` — on the right workload it does
+214,000+ req/s. But "each interpreter has its own GIL" is exactly the property
+that breaks a chunk of the C-extension ecosystem. Some of the most popular
+libraries in Python — pydantic, numpy, orjson — either refuse to load in a
+second sub-interpreter or corrupt memory when two interpreters touch them at
+once.
+
+So there's a fork in the road. Down one path is the traditional C-accelerated
+stack that assumes a single interpreter owns the process. Down the other is a
+set of libraries that are safe under sub-interpreters — and, it turns out,
+usually faster anyway. We call the second one the Golden Path.
+
+## Why C extensions break
+
+CPython 3.12+ lets you configure each sub-interpreter with a
+`PyInterpreterConfig`. Two fields matter:
+
+```c
+typedef struct {
+    int check_multi_interp_extensions;  // strict-mode flag
+    int gil;                            // OWN_GIL = independent GIL
+} PyInterpreterConfig;
+```
+
+When `check_multi_interp_extensions = 1` (strict mode), CPython refuses to
+import any C extension that hasn't declared:
+
+```c
+Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+```
+
+Almost no legacy C/C++ extension declares that flag yet — including numpy,
+orjson, pydantic-core, pandas, scipy, pillow, and *every* PyO3-based module
+(PyO3 doesn't support multiple interpreters at all). The reason is the oldest
+pattern in the C-extension book: module-level `static` globals.
+
+```c
+static PyObject *shared_type = NULL;   // one copy for the whole process
+
+PyMODINIT_FUNC PyInit__multiarray_umath(void) {
+    shared_type = create_type();       // initialized once
+}
+```
+
+Under a single interpreter that's fine. With several sub-interpreters sharing
+one process it is a minefield: two interpreter threads race on the same
+`static`; a `PyObject` created under interpreter A gets referenced under
+interpreter B (a different GIL domain); a `DECREF` runs in the wrong interpreter
+context. The failure modes are import errors at best and segfaults at worst.
+
+## What actually happens: the tested matrix
+
+Talk is cheap, so we measured it on Python 3.14.3, macOS ARM64 (2026-03-24),
+running each library in the second and third sub-interpreter. Rather than reprint
+the grid, I'll point at the compatibility matrix in the PEP field guide, which
+has the full results — numpy, orjson, stdlib `json`, stdlib `urllib`, lax versus
+strict. The two rows that carry this post's argument are numpy and orjson.
+
+numpy is the instructive one. Its `_multiarray_umath` extension checks *itself*
+on init and throws `cannot load module more than once per process`. That's numpy
+actively refusing to load in the second sub-interpreter — not a CPython
+limitation. Even when the first interpreter imports it fine, every later one
+fails, and concurrent use of its process-global state segfaults. Conclusion:
+numpy is unusable under sub-interpreters today. It needs a GIL route, or it
+needs to wait for upstream.
+
+Interestingly, orjson works fine in lax mode (`check_multi_interp_extensions =
+0`) despite not declaring the flag — its internal state is already isolated
+enough. That's the whole reason Pyronova ships lax mode by default: most
+well-behaved extensions load, and the ones that don't (numpy) you route around.
+The `strict_extensions=True` option exists for when you want CPython to enforce
+the guarantee instead of trusting the library.
+
+So orjson sits in an awkward middle, and it's worth being explicit about it: it
+runs *today* under lax mode, but it hasn't declared per-interpreter support, so
+it fails the instant you flip strict mode on — and it stays that way until
+upstream ships the flag. That's why the Golden Path table below still lists
+orjson under "replace." *Works in lax mode* is not the same as *safe*: stdlib
+`json` and `msgspec` are the ones that also survive strict mode, so they're what
+you build on if you want the guarantee rather than the benefit of the doubt.
+
+## The Golden Path table
+
+Here's the substitution map. Left column: what the tutorials tell you to use.
+Right column: what survives sub-interpreters.
+
+| Category | Traditional (GIL-bound) | Golden Path | Why |
+|---|---|---|---|
+| Validation | pydantic v2 | `msgspec` / `mashumaro` | pydantic-core is compiled Rust — one copy per process |
+| Data frames | pandas + numpy | `Polars` | pure-Rust internals, Arrow memory model |
+| HTTP client | `requests` | `httpx` (sync) | pure Python, no C deps |
+| JSON | `orjson` / `ujson` | stdlib `json` or `msgspec` | stdlib json is sub-interp safe |
+| Database | `psycopg2` | `psycopg` v3 (pure-Python mode) | psycopg2 is C; v3 has a pure-Python path |
+| Serialization | `pickle` | `msgspec` / `msgpack` | msgspec is Python with optional C speedups |
+| Crypto | `cryptography` | stdlib `hashlib` / `hmac` | OpenSSL bindings unsafe; stdlib is safe |
+
+The rule of thumb is blunt: **pure Python is safe.** If a package ships no
+`.so`/`.pyd` files, it will work in every sub-interpreter. If it ships C
+extensions, assume it needs a GIL route until proven otherwise.
+
+## The upgrade isn't a compromise
+
+The part that surprised me: moving to the Golden Path is not a tax you pay for
+parallelism. The safe libraries are frequently the *faster* libraries even
+single-threaded. msgspec decodes JSON substantially faster than pydantic; Polars
+outruns pandas on most operations and releases the GIL for heavy work. (Those
+are the libraries' own published claims, not something we benchmarked here.) So
+you get sub-interpreter safety and better per-core numbers at the same time.
+
+Stacked on top of true multi-core parallelism, the combined effect is large. The
+same handler logic on FastAPI + pydantic (single interpreter, GIL-serial) versus
+Pyronova + the Golden Path (10 interpreters) is exactly the FastAPI head-to-head
+from earlier in this series — 23.8–28.4× the throughput on the I/O routes and
+29–34× lower latency — so I won't reprint the table here. The throughput
+multiplier is the GIL being lifted across ten cores; the per-core piece is
+msgspec being genuinely fast.
+
+Note the CPU-bound row in that head-to-head is only 2.3×, not 28×. That's honest
+and expected: a 10k-element moving average is a tight numeric loop that pydantic's
+pipeline barely touches, so most of the win there is just having ten cores instead
+of one fighting for a single GIL, not library choice.
+
+> **Pyronova is open source.** If a pure-Python stack that survives
+> sub-interpreters *and* runs faster appeals to you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## You don't have to choose globally
+
+The escape hatch matters, because sometimes you genuinely need numpy or a model
+that only ships as a C extension. Pyronova's hybrid dispatch lets you mark
+individual routes as `gil=True` — those run on the main interpreter with the
+full ecosystem, single-threaded, while everything else runs parallel across
+sub-interpreters:
+
+```python
+from pyronova import Pyronova
+
+app = Pyronova()
+
+# Sub-interpreter path: parallel, pure Python only
+@app.post("/order")
+def create_order(req):
+    order = msgspec.json.decode(req.body, type=Order)
+    return {"accepted": True, "symbol": order.symbol}
+
+# GIL route: full ecosystem, single-threaded
+@app.post("/predict", gil=True)
+def predict(req):
+    import numpy as np          # safe here — one interpreter
+    return {"prediction": model.predict(features)}
+```
+
+The architecture rule writes itself: put your hot, high-QPS endpoints on
+sub-interpreters with Golden Path libraries; put the cold paths — admin,
+analytics, ML inference — on GIL routes where you can import anything. And if you
+want to know whether a given package is safe, the fastest test is `find` for
+`.so` and `.pyd` files inside it. No C extensions, no problem.
+
+Upstream is slowly catching up — numpy 2.x is incrementally adding
+per-interpreter support, and PEP 734 landed an `interpreters` stdlib module in
+3.14. When the big libraries finally declare
+`Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, we flip strict mode back on and get the
+full safety guarantee for free. Until then, the Golden Path is how you stay on
+every core without a segfault.

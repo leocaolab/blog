@@ -1,0 +1,35 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro"
+import { getSeriesList } from "../../lib/series.ts"
+
+export async function getStaticPaths() {
+  const series = await getSeriesList()
+  return series.map((s) => ({ params: { slug: s.slug }, props: { s } }))
+}
+
+const { s } = Astro.props
+const fmt = (d: Date) =>
+  d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+---
+
+<BaseLayout title={s.title} description={s.description}>
+  <div class="intro">
+    <h1>{s.title}</h1>
+    <p class="muted">{s.description}</p>
+    <p class="series-count">{s.count} parts</p>
+  </div>
+
+  <ul class="post-list">
+    {
+      s.parts.map((p, i) => (
+        <li>
+          <a href={`/blog/${p.id}/`}>
+            {i + 1}. {p.data.title}
+          </a>
+          <time datetime={p.data.date.toISOString()}>{fmt(p.data.date)}</time>
+          <p class="muted">{p.data.description}</p>
+        </li>
+      ))
+    }
+  </ul>
+</BaseLayout>

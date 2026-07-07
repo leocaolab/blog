@@ -1,0 +1,178 @@
+---
+title: "420k req/s on Linux: SO_REUSEPORT, M:N, LTO, mimalloc"
+description: "Decomposing the optimization wave that took a sub-interpreter Python server from a macOS ceiling to 419–429k req/s on an 8-core Linux box."
+date: 2026-07-07
+tags: ["performance", "benchmarks", "linux", "rust", "python", "http"]
+series: "pyre"
+seriesOrder: 26
+draft: false
+---
+
+Once we'd established that macOS couldn't fan out `SO_REUSEPORT` accepts and moved
+benchmarking to Linux, a backlog of optimizations that had been theoretically
+correct but unmeasurable suddenly had a machine that could show them working.
+Pyronova is a Rust web server that runs N CPython sub-interpreters in one process
+(PEP 684 — one GIL each, real parallelism). This is the v1.4.0 release: the wave
+that took it to **419,730 req/s on plaintext** on a single 8-core desktop chip.
+
+## The machine
+
+Everything below is measured, best-of-run, on one box:
+
+| Item | Value |
+|---|---|
+| CPU | AMD Ryzen 7 7840HS (8C/16T) |
+| RAM | 60 GB DDR5 |
+| OS | Ubuntu 24.04, Linux (x86_64) |
+| Python | 3.12.13 |
+| Rust | stable, LTO fat, `codegen-units=1` |
+| Server | v1.4.0, sub-interpreter mode, 16 workers + 16 io_workers |
+| Load tool | wrk 4.1.0 (`-t4 -c100 -d10s`) |
+
+Eight physical cores. No 64-core EPYC, no exotic NIC. That's the point — the
+numbers are honest about the hardware that produced them.
+
+## The wave, layer by layer
+
+The release bundled about a dozen changes. Not all of them are equally
+load-bearing; here are the ones that moved throughput, roughly in order of impact.
+
+### SO_REUSEPORT multi-accept
+
+This is the one the whole "move to Linux" story was about. Each I/O worker opens
+its own listening socket on the shared port, and the Linux kernel distributes
+incoming connections across them by 4-tuple hash. N independent accept loops, no
+shared accept lock, no userspace dispatcher. On macOS this collapsed to a single
+active listener (kqueue delivers all accepts to one socket), so v1.4.0
+auto-detects the platform: **N-way accept on Linux, fall back to 1 on macOS.**
+This is what turned the flat loopback line from the previous post into something
+that scales with core count.
+
+### M:N scheduling
+
+Pyronova stopped assuming the number of network threads should equal the number of
+Python workers. v1.4.0 splits them into two independently sized pools:
+
+- **`io_workers`** — Tokio I/O threads that own the accept loops and the socket
+  reads/writes.
+- **`workers`** — Python sub-interpreters that actually run your handler.
+
+You configure them separately (`app.run(workers=24, io_workers=16)` or via env).
+CPU-bound routes want `workers` ≈ core count; I/O-bound routes want more. The
+network layer and the compute layer stop fighting over the same knob. This
+benchmark ran 16 of each.
+
+### LTO fat + codegen-units=1
+
+Whole-program optimization at compile time. `codegen-units=1` lets the compiler
+see the entire crate as one unit instead of splitting it for parallel builds, and
+fat LTO inlines across crate boundaries. It costs you build time and buys a small
+bump on the JSON and path-param routes — the routes where the Rust-side
+serialization and routing code is the hot loop. We didn't isolate its
+contribution as a separate measurement, but it's free at runtime.
+
+### mimalloc as the global allocator
+
+Under high concurrency the system allocator becomes a contention point — every
+worker is allocating and freeing request/response buffers simultaneously.
+Swapping in mimalloc as the global allocator removes that as a bottleneck. It's
+the single most boring change on this list and one of the most reliable wins any
+high-concurrency server gets from it.
+
+### TCP_QUICKACK
+
+On Linux, delayed ACK holds back the acknowledgment for up to ~40ms hoping to
+piggyback it on outgoing data. For a request/response server that hurts
+time-to-first-byte. `TCP_QUICKACK` disables the delay, shaving latency off the
+tail.
+
+### The zero-copy / lazy-eval quartet
+
+A cluster of changes that don't add throughput on their own so much as *stop
+spending it*:
+
+- **serde_json + pythonize** — JSON is serialized on the Rust side instead of
+  round-tripping through Python's `json`.
+- **Bytes zero-copy body** and **SharedState `Bytes`** — request bodies and shared
+  state clone by reference-count bump, not by copying.
+- **`Arc<str>` method/path** and **lazy `IpAddr`** and **headers `OnceLock`** — the
+  method, path, client IP, and headers are only parsed/allocated if the handler
+  actually touches them. A route that never reads headers pays nothing for them.
+
+Individually each is a rounding error. Together they're the difference between a
+request that allocates a dozen times and one that allocates almost never.
+
+> **Pyronova is open source.** If per-core Python at 400k+ req/s interests you, ⭐ it on
+> GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or reproduce the
+> numbers yourself after a `pip install pyronova`.
+
+## The numbers
+
+### Route throughput (wrk -t4 -c100 -d10s)
+
+| Route | req/s | P50 | P99 |
+|---|---|---|---|
+| GET / (plaintext) | **419,730** | 188μs | 571μs |
+| GET /json | 406,947 | 197μs | 575μs |
+| GET /headers | 402,439 | 199μs | 550μs |
+| GET /user/42 (1 param) | 398,932 | 200μs | 661μs |
+| GET /user/7/post/99 (2 params) | 394,862 | 202μs | 659μs |
+| GET /compute (CPU) | 378,878 | 212μs | 778μs |
+| POST /echo (JSON parse) | 376,421 | 211μs | 725μs |
+| GET /query?a=1&b=2 | 372,729 | 216μs | 800μs |
+
+All eight routes hold **370k–420k req/s with P99 under 1ms.** The spread between
+the cheapest route (plaintext) and the most expensive (a POST that parses JSON) is
+about 11% — the Python handler cost is small relative to the fixed request cost,
+which is exactly what you want from a sub-interpreter design.
+
+### It doesn't fall over
+
+Two stress numbers matter more to me than the headline:
+
+- **300 seconds of sustained load:** averaged **400,683 req/s**,
+  **120,209,758 requests total**, P99 586μs, **zero non-2xx, zero socket errors.**
+  Memory grew **+26.7 MB** over five minutes and then stopped — no leak.
+- **c=1024 (extreme concurrency):** **356,328 req/s**, zero errors. Throughput
+  degrades ~15% from peak instead of collapsing.
+
+120 million requests, no errors, 27 MB of drift. That's the number I'd stake the
+release on.
+
+### Against a peer, at equal scale
+
+We compared against Robyn (an actix-web-based Python server) at deliberately
+matched worker scale — Robyn launched with `--processes 16 --workers 2` (32
+workers) against Pyronova's 16 sub-interpreters + 16 I/O threads in one process:
+
+| Route | Pyronova | Robyn | Ratio |
+|---|---|---|---|
+| GET / | 428,576 | 156,245 | 2.7× |
+| GET /json | 404,685 | 154,840 | 2.6× |
+| POST /echo | 371,601 | 144,071 | 2.6× |
+
+About **2.6–2.7× the throughput on ~1/3 the memory** (189 MB RSS in one process vs
+583 MB across 16). The structural reason is the whole premise of the project: N
+sub-interpreters share one address space, so each extra worker costs ~10 MB
+instead of a full ~35 MB process copy, and cross-worker shared state is an
+in-process channel instead of a Redis hop.
+
+## The honest caveats
+
+A few things this benchmark is *not*:
+
+- **This is 8 cores.** The doc includes a multi-core projection to 16/32/64 cores,
+  but a projection is a model, not a measurement — I won't quote projected numbers
+  as if they were run. At 64C+ the model itself expects channel contention and
+  NUMA cross-node access to erode linearity.
+- **wrk `-t4` is near client-side saturation at ~429k.** Pushing past this needs
+  more client threads or a second load box — some of the ceiling here is the
+  *generator*, not the server.
+- **Plaintext at ~420k on 8 cores is a good number, not a magic one.** A pure-Rust
+  server with no Python in the path will beat it. The claim is narrower and, I
+  think, more interesting: *this is what per-core CPython looks like when you stop
+  making the runtime the bottleneck.*
+
+The macOS ceiling was ~214k on the same class of workload. Landing at
+**419–429k on Linux** is roughly a 2× step, and almost all of it came from letting
+the kernel do the load balancing it was already willing to do.

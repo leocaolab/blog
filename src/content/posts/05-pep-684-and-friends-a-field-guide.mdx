@@ -1,0 +1,166 @@
+---
+title: "PEP 684 and friends: a field guide"
+description: "The five PEPs behind multi-core Python — 684, 703, 734, 630, 489 — what each one actually does, and why it matters if you're building a server."
+date: 2026-07-07
+tags: [python, gil, sub-interpreters, pyo3, architecture, http]
+series: "pyre"
+seriesOrder: 5
+draft: false
+---
+
+If you want to run Python on every core of a machine, five PEPs decide whether
+you can. Three of them describe *strategies* for escaping the GIL; two describe
+the *plumbing* that lets C extensions survive those strategies. They're often
+discussed as if they compete, but for a server author they're more like a stack:
+you pick a parallelism model on top, and the module-isolation PEPs determine what
+libraries you can bring along.
+
+Here's the field guide, from the perspective of someone who built a web server on
+this stuff and hit every sharp edge.
+
+## PEP 684 — A Per-Interpreter GIL
+
+**Shipped: Python 3.12, October 2023.**
+
+This is the one that matters most. It gave each sub-interpreter its own GIL (post
+04 has the full origin story) — N sub-interpreters, N GILs, N cores running Python
+bytecode at once, all inside a single OS process.
+
+Mechanically, you create an interpreter with a `PyInterpreterConfig` and ask for
+`OWN_GIL`:
+
+```c
+typedef struct {
+    int check_multi_interp_extensions;  // the compatibility gate (see below)
+    int gil;                            // OWN_GIL = its own GIL
+    // ...
+} PyInterpreterConfig;
+```
+
+Why it matters for a server: this is the entire premise. Instead of removing the
+GIL or forking processes to route around it, you *multiply* the GIL — one per
+worker. A 16-core box becomes a 16-core Python server in one process, one set of
+file descriptors, one set of metrics. Everything else in this list exists either
+to give you a different flavour of the same goal, or to keep your C extensions
+from crashing once you get there.
+
+## PEP 703 — Making the GIL Optional (free-threading)
+
+**Python 3.13+, experimental.**
+
+The other strategy: don't multiply the GIL, *delete* it. Free-threading is a
+single interpreter with no GIL at all — real shared-memory threads, the way
+people wish Python already worked. It's the right model for shared-memory
+parallel computation where threads genuinely need to touch the same objects.
+
+The catches are real. It's still experimental, it ships as a separate build, and
+removing the GIL means every object needs thread-safe refcounting, which imposes
+a measurable cost on *single-threaded* workloads. Free-threading and
+sub-interpreters aren't the same bet: free-threading trades a refcount tax for
+shared memory; sub-interpreters keep the GIL (cheap, per worker) but give up
+shared objects. For an HTTP server where requests are naturally independent, the
+sub-interpreter bet is the cheaper one — no refcount tax, and isolation is a
+feature, not a limitation.
+
+> **Pyronova is open source** — built on PEP 684 with the compatibility gate handled
+> for you. If this PEP stack interests you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## PEP 734 — The `interpreters` stdlib module
+
+**Python 3.14.**
+
+PEP 684 gave you per-interpreter GILs at the C-API level. PEP 734 finally exposes
+sub-interpreters to *Python* code, as a real standard-library module —
+`interpreters` — with queue-based communication built in. Before this, using
+sub-interpreters meant dropping into the C-API or a third-party extension; now
+there's a supported, documented Python surface for creating interpreters and
+passing data between them.
+
+Why it matters for a server: it standardizes the communication primitive. You no
+longer have to invent your own channel to move data across interpreter
+boundaries — though high-performance frameworks still will, because a
+purpose-built native channel beats the general-purpose one. Pyronova, for
+instance, uses a custom C-FFI bridge for native async without crossing GILs. But
+PEP 734 is what makes sub-interpreters approachable for everyone else.
+
+## PEP 630 & PEP 489 — the module-isolation plumbing
+
+**PEP 489 — Multi-Phase Initialization. PEP 630 — Isolating Module Objects.**
+
+These two are the unglamorous load-bearing PEPs. They don't give you
+parallelism; they make it *survivable* for C extensions.
+
+The problem: a C extension that stores state in a module-level `static` variable
+assumes there's exactly one interpreter. Under sub-interpreters there are many,
+sharing that one global. The failure modes are exactly what you'd fear —
+
+1. **Data races:** two interpreters' threads read/write the same global `static`.
+2. **Type confusion:** a `PyObject` created in interpreter A is referenced by
+   interpreter B, across GIL domains.
+3. **Refcount corruption:** a `DECREF` runs in the wrong interpreter context.
+
+PEP 489 (multi-phase init) lets an extension be initialized once per interpreter
+instead of once per process, and PEP 630 shows how to move that `static` state
+into per-interpreter module state (`PyModule_GetState`) so each interpreter gets
+its own copy. An extension that adopts both can declare it's safe:
+
+```c
+Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+```
+
+That declaration is what CPython checks when
+`check_multi_interp_extensions = 1` (strict mode). In strict mode, importing an
+extension that *hasn't* declared support raises `ImportError` — CPython refusing
+to let an unsafe global near your sub-interpreters.
+
+## The compatibility gate, in practice
+
+Here's where theory meets a segfault. The overwhelming majority of legacy C
+extensions haven't declared `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` yet —
+including numpy, orjson, pydantic-core, pandas, scipy, pillow, and *every*
+PyO3-based extension (PyO3 doesn't support multiple interpreters).
+
+So a server has two modes:
+
+- **Strict** (`check_multi_interp_extensions = 1`): only declared-safe extensions
+  load. Safe, but rejects most of the ecosystem today.
+- **Permissive** (`check_multi_interp_extensions = 0`): undeclared extensions are
+  allowed to load. Many well-behaved libraries work — they've done the internal
+  isolation without formally declaring it — but a genuinely unsafe global can
+  segfault at runtime, with no load-time protection.
+
+The measured reality, tested on Python 3.14.3 (macOS ARM64, 2026-03-24):
+
+| Library | Version | Permissive | Strict | Notes |
+|---------|---------|-----------|--------|-------|
+| numpy | 2.4.3 | ⚠️ single worker only | ❌ ImportError | 2nd sub-interpreter's `import numpy` → `ImportError: cannot load module more than once per process`; concurrent load → segfault |
+| orjson | 3.11.7 | ✅ fully working | ❌ ImportError | multi-interpreter concurrency, no issues |
+| json (stdlib) | — | ✅ | ✅ | pure Python |
+| urllib (stdlib) | — | ✅ | ✅ | pure Python |
+
+numpy is the sharp lesson: its `_multiarray_umath` module actively rejects a
+second load per process. That's numpy's own guard, not a CPython limitation —
+even if the first sub-interpreter imports it fine, every later one fails, and
+concurrent use of its global state segfaults. Until numpy declares multi-phase
+support, it's a GIL-route-only library.
+
+## The state of play
+
+The ecosystem is tracking toward safety. numpy's 2.x line is adapting
+incrementally; PyO3's multi-interpreter support is under discussion with no ETA;
+CPython landed the `interpreters` stdlib in 3.14 (PEP 734). As more libraries
+declare `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, servers can flip
+`check_multi_interp_extensions` back to strict mode and get the full safety
+guarantee for free.
+
+The short version for anyone building on this:
+
+- **PEP 684** is the engine — per-interpreter GIL, shipped 3.12.
+- **PEP 703** is the other engine — no GIL at all, experimental in 3.13.
+- **PEP 734** is the Python-level API — stdlib `interpreters`, 3.14.
+- **PEP 489 + PEP 630** are the plumbing that keeps C extensions alive.
+
+You build on 684. You watch 703 to see if the free-threading tax comes down. You
+adopt 734 for the ergonomics. And you spend most of your actual debugging time on
+489 and 630, because that's where the ecosystem still hurts.

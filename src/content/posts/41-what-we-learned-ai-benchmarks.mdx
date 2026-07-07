@@ -1,0 +1,105 @@
+---
+title: "What we learned: AI, benchmarks, and where we stopped"
+description: "The retrospective. Both goals held up — sub-interpreters deliver, and an AI pipeline can drive hardcore optimization. Why it does that better than normal coding, the debugging that surprised us, and the one problem that made us stop."
+date: 2026-07-07
+tags: [ai, benchmarks, debugging, performance, python]
+series: "pyre"
+seriesOrder: 41
+draft: false
+---
+
+We started this series with two goals: **high performance** — can sub-interpreters
+carry a real multi-core web server? — and **pure AI** — could a pipeline build the
+whole thing, Rust engine, unsafe C-API, benchmarks, and these posts, with no human
+writing code? Both held up. And building it handed us a third goal we hadn't
+started with. So we're ending with three.
+
+## The first two held up
+
+**Sub-interpreters delivered.** Multiplying the GIL — N interpreters, N cores,
+full isolation — got a Python server to within a few percent of pure-Rust
+throughput, survived long soak tests, and beat the multi-process Python field
+by a wide margin. The model has real costs (data copies at the boundary, memory
+per interpreter), but as a path to multi-core Python it's the real thing.
+
+On raw request-handling we feel we've come close to the ceiling of what a Python
+server can do — but *close* isn't *done*. There's still real headroom in the
+places we haven't fully pushed: **async database access**, **JSON serialization**,
+and **hardware-specific tuning**. The speed story isn't finished — it's just
+paused behind a different one.
+
+**And the AI built all of it.** That was the bet nobody had really made — point an
+AI at hardcore systems optimization, not CRUD, and see how far it gets. It got
+far.
+
+## Why AI is *better* at this than at normal coding
+
+The surprising part: performance work turned out to be a *better* fit for AI than
+ordinary feature coding — because of the benchmark.
+
+Most coding tasks have a fuzzy success signal. "Is this code good?" is a matter of
+taste, and AI is happy to produce plausible-looking code that's subtly wrong.
+Optimization doesn't work like that. A benchmark is a **continuous, objective,
+un-bullshittable signal**. Change something, run wrk, read the number. The loop is
+tight and the feedback is honest: measure → optimize → measure again. The AI can
+argue its way past a code reviewer, but it cannot argue its way past 225 req/s.
+That number is the truth every single iteration, and it dragged the whole project
+forward.
+
+## The flip side — and why the benchmark is a guardrail, not just a throttle
+
+The honest counterexample is the most useful thing in this series. Early on, the
+AI confidently concluded that free-threaded Python "lost" to sub-interpreters
+because of atomic-refcount overhead — and wrote a whole crisp, mechanistic
+explanation for it. It had copied that conclusion straight from an internal
+benchmark doc. It sounded right. It was wrong — but note *exactly* what was wrong. Not that the
+tax exists: the atomic-refcount overhead is real, and it's roughly the ~2–3% edge
+sub-interpreters hold over free-threading in a fair fight. The error was calling
+that a *decisive loss* on the strength of a "benchmark" that had never actually
+exercised free-threading at all. A fresh, controlled experiment showed the two
+approaches are throughput peers.
+
+What caught it wasn't a smarter model. It was a human asking "are you sure?" and
+then a *new benchmark*. That's the real lesson: without a measurement to check
+against, an AI will state a plausible falsehood with total confidence. The
+benchmark isn't just what pushes the AI forward — it's the guardrail that catches
+its confident mistakes. No benchmark, no ground truth, no trust.
+
+## The debugging genuinely surprised us
+
+We expected code generation. We didn't expect investigation. Chasing the
+cross-thread `PyThreadState` leak — a bug hidden behind three plausible red
+herrings — the AI did delta debugging, **downloaded profiling tools, read flame
+graphs**, wrote a standalone C reproducer to isolate the cause, and worked the
+hypothesis space down to the real culprit. Mostly on its own, without a lot of
+prompting. That's not autocomplete finishing a line; that's an investigator
+narrowing a search.
+
+> **Pyronova is open source.** ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Goal 3, the one we added: high maintainability
+
+We didn't start out testing this one — building the first two forced it onto the
+list. Because the one weakness AI-built code reliably has is **quality**. Speed
+accretes; so does mess. You can push the numbers higher on a codebase that's
+quietly turning into a liability, and all you've built is a fast liability. So the
+target grew: not just fast, not just AI-built, but *maintainable* — and that turns
+out to be the hardest of the three.
+
+So we ran [**arc**](https://github.com/leocaolab/getarc) — our own code-quality
+tool — over the whole codebase. It surfaced **several hundred issues** and
+**auto-fixed a portion of them**. The majority it deliberately left *unfixed for
+now* — not because they don't matter, but because most deserve a real, systematic
+fix rather than a quick patch. Rather than paper over them by hand, we're waiting
+for **a better version of arc** to handle them properly. Optimizing harder on top
+of unresolved quality debt is exactly the trap we're refusing to walk into.
+
+So the next chapter isn't more throughput — it's cleanup, hardening, and
+maintainability, AI-driven and arc-guided. And that's really the point: this
+started as a two-goal experiment and grew a third. It could grow a fourth.
+
+This isn't a finish line. It's the honest state of an open project — fast,
+AI-built, and now learning to stay clean enough to keep going. The benchmark kept
+the *speed* honest; the open question is what keeps the *code* honest, and we're
+only just starting to answer it.

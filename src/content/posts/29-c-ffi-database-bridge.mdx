@@ -1,0 +1,175 @@
+---
+title: "Breaking the gil=True ceiling: a C-FFI database bridge"
+description: "The obvious way to serve async Postgres funnels every query through one GIL and caps the DB path at a few thousand req/s. Breaking it meant a C-FFI bridge — and finding out why 'just unmock the pyclass' fails at the module-slot layer."
+date: 2026-07-07
+tags: [sub-interpreters, gil, pyo3, rust, async]
+series: "pyre"
+seriesOrder: 29
+draft: false
+---
+
+Pyronova runs N CPython sub-interpreters in one process, each with its own GIL, so that
+Python handlers execute in parallel across cores. That's the whole architecture. So when I
+added an async Postgres route, there was an obvious shortcut sitting right there — and it
+quietly threw the entire architecture away for that one path.
+
+This is the story of the `gil=True` ceiling: why the easy database route serializes every
+query through a single interpreter, why the tempting one-line fix (`just delete the mock
+and import the real thing`) fails at a layer most people never look at, and the C-FFI
+bridge that actually breaks the ceiling.
+
+## The ceiling: 3.7k req/s from a single interpreter
+
+Pyronova lets a handler opt into running on the **main interpreter** with a `gil=True`
+flag. It exists for handlers that touch objects which can't cross the sub-interpreter
+boundary. The first cut of the async-DB handler used it — it was the path of least
+resistance, and it worked, which is exactly the problem.
+
+Here's what `gil=True` does:
+
+- Every request queues onto the **main interpreter's** single worker, not the pool of
+  sub-interpreter workers.
+- Those sub-interp workers sit idle for this route.
+- The main interp's GIL serializes the handler's bytecode — param parsing, dict
+  construction, the JSON return — one request at a time.
+
+The `sqlx` connection pool underneath is async and thread-safe; that part is fine. But
+dispatch into it is single-threaded, because one GIL is feeding it. Measured result:
+**3.7k req/s**, which lines up almost exactly with a single-GIL bound on the per-request
+Python bytecode plus the Rust-side transition cost (~270 µs/req). The database isn't the
+bottleneck. The pool isn't the bottleneck. *One interpreter doing all the work* is the
+bottleneck — while every other core sits idle.
+
+## "Just unmock the pyclass and go"
+
+The Rust side is already built for concurrent multi-interpreter access, which makes the
+fix look trivial:
+
+- `static PG_POOL: OnceLock<sqlx::PgPool>` is **process-global**, not per-interpreter.
+- `sqlx::PgPool` is `Clone + Send + Sync` — internally an `Arc<SharedPool>`.
+- The `PgPool` pyclass is **zero-sized** (`struct PgPool;`); every method dispatches
+  through a `pool_ref()` that returns the one global pool, no matter who calls it.
+- `connect()` is already idempotent: if the `OnceLock` is set, it just hands back a
+  `PgPool` handle.
+
+So the natural instinct is: delete the `_MockPgPool` that sub-interpreters currently use,
+let them `import` the real `PgPool`, and since the pool is global and thread-safe, every
+sub-interp worker will drive a concurrent query against it. One-line fix. Ship it.
+
+It fails. Not at the pool, not at `sqlx`, not at any logic you'd think to test — it fails
+at module import, for a reason baked into CPython 3.12's sub-interpreter model.
+
+## Why it fails: the missing module slot
+
+Here's the layer you have to know about. When PyO3 generates the native extension module,
+it emits something equivalent to:
+
+```rust
+#[pymodule]
+fn engine(m: &Bound<PyModule>) -> PyResult<()> { ... }
+```
+
+That module is declared **without** a `Py_mod_multiple_interpreters` slot. Under CPython
+3.12+, a C extension module that doesn't explicitly advertise that slot is *refused* when
+something tries to import it inside a sub-interpreter. The import raises:
+
+```
+ImportError: module does not support loading in subinterpreters
+```
+
+This is not a bug or an oversight in CPython — it's the safety mechanism. A native module
+that hasn't been audited for sub-interpreter safety could be holding process-global C
+state that assumes one interpreter; CPython refuses to load it rather than let it corrupt
+things silently.
+
+Which means the real `engine` module — every `#[pyclass]` in it — simply *cannot be
+imported* in a sub-interpreter today. That's why Pyronova hand-rolls a `_mock_engine` in
+its bootstrap: it's the only way a sub-interpreter can satisfy a user's
+`from pyronova.engine import ...` line at all. `Request`, `Response`, `SharedState` — none
+of them come from the Rust pyclass inside a sub-interp; they're all reconstituted there
+via C-FFI shims.
+
+So trace what "just delete `_MockPgPool`" actually does:
+
+1. `from pyronova.db import PgPool, PgCursor` runs in the sub-interp.
+2. That triggers `from .engine import PgPool, PgCursor`.
+3. But `sys.modules["pyronova.engine"]` is already the mock, which has no `PgPool`
+   attribute.
+4. `ImportError` at sub-interp replay time — every async-DB request dies before it reaches
+   the handler.
+
+The one-liner doesn't just underperform. It doesn't run.
+
+## Design A: a C-FFI DB bridge
+
+If the pyclass can't cross the boundary, don't send the pyclass — send the *call*. This is
+the same pattern that already carries `Request` and `Response` across the interpreter line:
+a C function, injected into each sub-interp's globals as a PyCapsule, that the mock Python
+object forwards to.
+
+The sub-interp's `PgPool` becomes a thin Python class whose `fetch_all(sql, *params)`
+calls a capsule, `_pyronova_db_fetch_all(worker_id, sql, params)`. On the Rust side that
+function does:
+
+1. Parse the params into a Rust `Vec<BoundParam>` **while holding the sub-interp's GIL**.
+2. Release that GIL with `py.detach()`.
+3. Look up the process-global `PG_POOL` (already thread-safe).
+4. Run the `sqlx` query on the shared DB runtime.
+5. Encode the result rows into a contiguous Rust-owned buffer.
+6. Reacquire the calling interpreter's GIL, materialize the buffer into a
+   `PyList[PyDict]`, and return it.
+
+The injection point already exists: `src/interp.rs` injects `_pyronova_emit_log`,
+`_pyronova_recv`, and `_pyronova_send` into every sub-interp as builtin PyCapsules. The DB
+bridge just adds `_pyronova_db_fetch_all` / `_fetch_one` / `_fetch_scalar` / `_execute`
+next to them, and the bootstrap swaps the inert `_MockPgPool` for a bridge-backed one whose
+methods forward to those capsules.
+
+```python
+# the payoff — no gil=True
+@app.get("/async-db")
+def async_db(req):
+    rows = PG_POOL.fetch_all(_DB_SQL, int(req.query_params.get("limit", 10)))
+    return {"items": [dict(r) for r in rows], "count": len(rows)}
+```
+
+The important move is step 2 and step 4 together. Because the function releases the calling
+interpreter's GIL *before* touching the pool, and the pool is a `&'static sqlx::PgPool`, N
+sub-interp workers can each have a query in flight against the same pool simultaneously —
+`sqlx` handles the fan-in. The parallelism ceiling moves from **1** (one GIL) to
+`min(cores, max_connections)`.
+
+The new cost is the serialization in step 5 — encoding rows to a buffer and decoding once
+on the Python side. For a realistic payload (~200 B/row × 1000 rows ≈ 200 KB) that's about
+5–10 µs, which is nothing against a ~1 ms Postgres round-trip. Expected result: **3.7k →
+30k+ req/s** — from one busy interpreter to every worker issuing queries in parallel.
+
+> **Pyronova is open source.** If C-FFI bridges across CPython sub-interpreters are your
+> kind of thing, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Why not just fix the module slot? (Design B)
+
+There is a "correct" long-term answer, and it's worth naming so nobody thinks the bridge
+is the endgame. PyO3 0.28 can truthfully declare `Py_mod_multiple_interpreters` when a
+module is actually sub-interpreter-safe. If the `engine` module could set that slot, the
+mock disappears and every pyclass — `PgPool`, `SharedState`, `Stream`, `WebSocket` — loads
+natively in sub-interps.
+
+The reason that isn't the fix *this week*: declaring the slot is a promise you have to
+keep. Every `#[pyclass]` has to be audited for sub-interpreter safety first. Any `Py<T>`
+handle that crosses interpreters is an immediate soundness violation and a segfault risk —
+and there are real ones, e.g. `SharedState` holds `Arc<DashMap<String, Py<PyAny>>>`, and
+those `Py<PyAny>` handles are interpreter-tied. Flipping the slot without doing that audit
+doesn't make the module safe; it just removes the guardrail that was catching the problem.
+
+So the bridge is deliberately the *additive, contained* choice: new C functions, a new
+bridge-backed mock, and dropping `gil=True` in the app. No existing pyclass changes, no
+interpreter-affinity audit, and if an edge case in the bridge misbehaves you revert the
+injection and re-enable the mock — the `gil=True` path is untouched. The full pyclass audit
+that unlocks native sub-interp DB access is real work worth doing, and it's filed as its own
+track, not smuggled into a benchmark deadline.
+
+The bridge breaks the ceiling. It doesn't raise it to the sky, though — as the next posts
+show, once every core is issuing queries, a *new* ceiling shows up, and it's a more
+interesting one.

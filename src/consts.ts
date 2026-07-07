@@ -12,8 +12,20 @@ export const SITE = {
   github: "https://github.com/leocaolab",
 }
 
+// Series registry — display metadata for multi-part series. The `series` slug in
+// a post's frontmatter keys into this. Parts (and their order) come from the
+// posts themselves; this just supplies a human title + blurb for listings.
+export const SERIES = {
+  pyre: {
+    title: "Building Pyronova",
+    description:
+      "The full engineering story of a multi-core Python web server — from the GIL problem to a Thread-Per-Core rewrite.",
+  },
+}
+
 export const NAV = [
   { href: "/", label: "Home" },
   { href: "/blog", label: "Writing" },
+  { href: "/series", label: "Series" },
   { href: "/tags", label: "Topics" },
 ]

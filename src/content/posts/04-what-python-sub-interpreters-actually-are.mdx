@@ -1,0 +1,177 @@
+---
+title: "What Python sub-interpreters actually are"
+description: "Isolation, parallelism, memory safety, C-extension compatibility — the four properties that separate sub-interpreters from threads and from multiprocessing."
+date: 2026-07-07
+tags: [python, sub-interpreters, gil, architecture, memory]
+series: "pyre"
+seriesOrder: 4
+draft: false
+---
+
+Most Python engineers know sub-interpreters as a footnote: a C-API curiosity
+that has technically existed since Python 1.5 (1997) but never did anything
+useful, because every sub-interpreter shared a single Global Interpreter Lock
+with the main one. You could create them. You couldn't run Python in parallel
+with them. So nobody did.
+
+That footnote changed in Python 3.12. **PEP 684 — A Per-Interpreter GIL** gave
+each sub-interpreter its own GIL. For the first time, a single Python process
+can execute genuinely parallel Python bytecode on multiple CPU cores without
+spawning separate OS processes. Pyronova — the Python web server this series is
+about — is built entirely on that one change, so it's worth being precise about
+what a sub-interpreter actually *is*.
+
+## The definition
+
+A sub-interpreter is a fully independent Python interpreter created inside an
+existing process via the C-API call `Py_NewInterpreter()`. It shares the host
+process's memory space and the CPython binary, but it maintains its own:
+
+- module imports and module state
+- built-in types and singletons
+- exception state
+- thread state (`PyThreadState`)
+- reference-count bookkeeping
+- since Python 3.12 (PEP 684): its own GIL
+
+That last line is the whole story. Python's GIL has been the canonical
+explanation for why CPU-bound Python doesn't scale across cores — and why every
+team eventually reaches for `multiprocessing`, with all the fork-vs-spawn
+quirks, IPC overhead, and shared-memory friction that comes with it. A
+per-interpreter GIL changes the cost calculus: parallel Python is now possible
+without leaving the process.
+
+## The four properties
+
+Sub-interpreters are best understood through four properties that together
+distinguish them from threads, from `multiprocessing`, and from coroutine-based
+concurrency. Three of them are gifts. The fourth is where you'll get hurt.
+
+### 1. Isolation
+
+Each sub-interpreter has its own module dictionary, its own globals, and its own
+copy of every imported module. A change in one sub-interpreter — mutating a class
+attribute, monkey-patching a module, setting a global — is invisible to every
+other sub-interpreter.
+
+What that buys you:
+
+- A buggy handler that corrupts module state in one worker doesn't touch the
+  others.
+- Monkey-patching for tests can't leak across boundaries.
+- A C extension's module-level state is per-interpreter, not process-global.
+
+The tradeoff is that communication between sub-interpreters is *intentionally*
+restricted. You can't pass a Python object from one interpreter to another the
+way threads share memory. Cross-interpreter data moves through explicit
+channels, byte buffers, or shared atomic primitives — never a shared `dict`.
+
+### 2. Parallelism
+
+Since Python 3.12, each sub-interpreter has its own GIL, so N sub-interpreters
+can execute Python bytecode on N cores simultaneously. This is the property that
+turns a 16-core machine into a true 16-core Python server, with no process-fork
+overhead in the middle.
+
+The honest caveat: parallelism only helps CPU-bound work. I/O-bound workloads —
+database calls, HTTP requests — already release the GIL during system calls, so
+they gain little from having more of them. And this is per-interpreter
+parallelism, not free-threading: objects still aren't shared.
+
+### 3. Memory safety
+
+Every sub-interpreter has its own reference-counting bookkeeping. An object
+created in interpreter A cannot be referenced from interpreter B without an
+explicit transfer. CPython enforces this through `PyThreadState`, which binds the
+current execution context to a specific interpreter.
+
+The payoff is operational:
+
+- No race conditions on shared Python objects — there are none to share.
+- Garbage collection runs per-interpreter, on its own schedule.
+- A memory leak in one interpreter is bounded to that interpreter's arena.
+- Killing a stuck sub-interpreter doesn't corrupt its neighbours.
+
+That last point is what lets a server monitor per-interpreter RSS and recycle a
+worker that grows without bound, isolated from the rest of the process.
+
+> **Pyronova is open source** — these four properties turned into a working web
+> server. If sub-interpreters interest you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+### 4. C-extension compatibility
+
+This is the messy one. A C extension compiled against an older CPython API often
+holds global state that violates per-interpreter isolation. A single
+`static PyObject *my_module_state` in C code becomes a process-wide bug the
+moment two sub-interpreters touch it: data races on the global, type confusion
+across GIL domains, refcounts decremented in the wrong interpreter context.
+
+PEP 630 (Isolating Module Objects) and PEP 489 (Multi-Phase Initialization)
+define the path forward, but adoption is uneven. The rough shape today:
+
+| Works | Doesn't (yet) |
+|-------|---------------|
+| Pure-Python libraries | Older C extensions with module-level globals |
+| Modern C extensions using multi-phase init | Most PyO3-based extensions |
+| Most stdlib modules | Some mature scientific libraries' long tail |
+
+`numpy` is the cautionary tale. Its docs describe experimental sub-interpreter
+support, but in practice its `_multiarray_umath` module refuses to load a second
+time in a process — the second sub-interpreter to `import numpy` gets
+`ImportError: cannot load module more than once per process`, and concurrent use
+can segfault. Test your dependencies in a sub-interpreter harness *before* you
+build on them. This is the property most likely to surprise you in production.
+
+## How they combine into an architecture
+
+The properties are useful individually, but together they unlock a class of
+server design that neither `gunicorn -w N` (multiple processes) nor threaded
+servers (one shared GIL) can express:
+
+1. The process boots and creates N sub-interpreters, one per CPU core.
+2. Each sub-interpreter loads the application code independently.
+3. Incoming HTTP requests are dispatched to a sub-interpreter over a lock-free
+   channel.
+4. The handler runs in that sub-interpreter, in parallel with handlers in the
+   others.
+5. The response goes back through the channel.
+6. Periodic health checks verify per-interpreter RSS and restart any that drift.
+
+Isolation gives each worker its own route table and prepared-statement cache.
+Parallelism serves N cores from one process. Memory safety keeps a leaky handler
+quarantined in one worker's arena. C-extension compatibility decides what the
+workers can actually run — and dictates a fallback "GIL route" that dispatches
+legacy-C-extension calls to the main interpreter, which still holds the old
+shared GIL.
+
+Concretely: Pyronova's benchmarks on a Ryzen 7 7840HS (8 cores, 16 threads) show
+**422,976 requests per second** on the plaintext baseline at v1.5.0 — throughput
+that traditional architectures need 8+ separate Python processes to reach.
+
+## The FAQ, answered honestly
+
+**Sub-interpreter vs thread?** Threads share one interpreter and one GIL — only
+one runs Python bytecode at a time. Sub-interpreters each have their own
+interpreter and, since 3.12, their own GIL, so N run in parallel on N cores.
+
+**Do they replace `multiprocessing`?** Not entirely. `multiprocessing` gives you
+full process isolation — separate memory, separate file descriptors, immune to a
+peer's corruption. Sub-interpreters give you Python-level isolation in one
+process at much lower startup and operational cost. For web servers and workers,
+sub-interpreters are increasingly the better fit; for fully independent batch
+jobs, processes still make sense.
+
+**Which Python?** Per-interpreter GIL requires 3.12 or later. Target 3.13+ in
+production — many of the early `PyThreadState` lifecycle rough edges are smoothed
+there.
+
+**Faster than threads?** For CPU-bound Python, dramatically — up to Nx on N
+cores, because threads share one GIL and sub-interpreters don't. For I/O-bound
+code, the gap is small.
+
+Sub-interpreters aren't magic. They're a different set of tradeoffs: cheaper than
+processes, isolated where threads aren't, and blocked mainly by the C-extension
+ecosystem's slow march toward multi-phase init. For the workloads that fit —
+HTTP servers, task workers, pipeline stages — they're often the best tool Python
+has. The next post in this series maps the PEPs that make them work.

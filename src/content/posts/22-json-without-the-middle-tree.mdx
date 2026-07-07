@@ -1,0 +1,183 @@
+---
+title: "Serializing JSON without the middle tree"
+description: "A plan to write Python objects straight to JSON bytes — skipping the intermediate serde_json::Value tree — for a projected +30–50% on small payloads."
+date: 2026-07-07
+tags: [python, rust, performance, benchmarks, http, architecture]
+series: "pyre"
+seriesOrder: 22
+draft: false
+---
+
+Most of the time, a JSON serializer is not your bottleneck. Under a
+sub-interpreter web server the wins come from lifting the GIL across cores and
+from a tight worker-dispatch path, and those dominate every headline number.
+Then you point a TechEmpower-style benchmark at it, and the ruler changes.
+
+The JSON test there returns `{"message":"Hello, World!"}`. That payload is so
+small that *nothing* is hidden. There's no I/O to wait on, no big body to
+compress, no database round-trip to dwarf framework overhead. Every allocation
+you make per request is now a measurable fraction of the request. This post is
+the design for making that path lean — presented as a plan, because it is one;
+the current code is shipping and correct, and this is the optimization roadmap
+sitting on top of it.
+
+## The current pipeline
+
+On the response path, a returned Python object becomes bytes like this:
+
+```
+Python obj  →  py_to_json_value  →  serde_json::Value
+            →  sonic_rs::to_vec(&val)  →  Vec<u8>  →  Bytes
+```
+
+Two passes over the data, and a full `serde_json::Value` tree built in the
+middle. Every dict key string is cloned — `to_string_lossy().into_owned()` —
+and every nested object becomes its own `serde_json::Map<String, Value>`
+allocation. For `{"message":"Hello, World!"}` that's a heap-allocated map, a
+heap-allocated key `String`, a `Value` enum wrapping the string, all constructed
+only to be immediately walked again by `sonic_rs::to_vec` and thrown away.
+
+Current scores on the TechEmpower-style suite: **JSON 30.8 (329k req/s)**, JSON
+Compressed 21.0, JSON TLS 47.3.
+
+### Why it was built this way
+
+This isn't an accident anyone should be embarrassed by. The current
+`JsonContext` was written with correctness as the primary goal, and it carries a
+real list of guarantees:
+
+- JSON Path errors (so a serialization failure tells you *where*)
+- circular reference detection
+- a depth limit of 256
+- surrogate handling
+- bigint preservation
+- bool/int subclass isolation
+
+The intermediate `serde_json::Value` tree made every one of those easy to
+implement — you materialize the whole thing, then reason about it. And at the
+time, throughput was not the axis the framework was being judged on; sub-interp
+and the channel pool were where the wins lived. The tiny-payload benchmark is
+what makes the intermediate tree suddenly expensive.
+
+The key insight: **none of those correctness guarantees actually need the tree.**
+Path tracking, circular detection, the depth limit, and signal checks are all
+orthogonal to the output representation. You can keep every one of them while
+emitting bytes directly.
+
+## The roadmap, ranked by ROI
+
+### 1. Direct Python → bytes writer (the big win)
+
+Replace the function that returns a `serde_json::Value` with one that writes
+bytes straight into an output buffer:
+
+```rust
+pub(crate) fn py_to_json_bytes(
+    obj: &Bound<'_, PyAny>,
+    out: &mut Vec<u8>,
+) -> Result<(), PyJsonError>;
+```
+
+Type by type:
+
+- `PyString` → `to_str()?` borrows the UTF-8 buffer; escape directly into `out`
+- `PyInt` → `itoa::write(out, v)`
+- `PyFloat` → `ryu::write(out, v)` (with the existing NaN/Inf handling)
+- `PyDict` / `PyList` / `PyTuple` → write the `{` `,` `}` / `[` `,` `]`
+  delimiters inline as you walk
+
+This deletes the entire `serde_json::Value` tree and every per-key `String`
+clone. Projected **+30–50%** on the JSON throughput number, with an even larger
+relative win on big payloads — the intermediate tree scales linearly with
+payload size, so the bigger the response, the more you were paying to build a
+copy of it.
+
+### 2. SIMD-accelerated string escape
+
+Once you're writing bytes yourself, string escaping becomes the hot loop. The
+observation that makes it cheap: most strings contain no character that needs
+escaping. So scan first, escape only on a hit:
+
+```rust
+// memchr3(b'"', b'\\', <control byte>) → no hit ⇒ extend_from_slice the whole span
+```
+
+Fall back to per-byte escaping only when a quote, backslash, or control
+character actually appears. This is exactly what `sonic_rs` does internally — the
+difference is that today that fast escape happens on the *second* pass over an
+already-materialized tree. After step 1 it's on the only pass.
+
+### 3. Thread-local output buffer reuse
+
+Each request currently allocates a fresh `Vec<u8>` and grows it by doubling.
+Reuse a per-worker buffer instead:
+
+```rust
+thread_local! {
+    static JSON_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
+}
+```
+
+Clear before serialize, copy into `Bytes` after. That kills the realloc chain
+and the small initial allocations on every hot-path request. Cheap and isolated —
+worth doing regardless of the rest.
+
+### 4. Dict-key fast path
+
+Today `coerce_dict_key` does `to_string_lossy().into_owned()` for every
+`PyString` key — one clone per key, on every object. Once we're escaping into the
+output buffer (step 1), keys borrow via `to_str()?` and escape straight in. Zero
+allocation per key. This shares almost all its code with step 1, so they ship
+together.
+
+> **Pyronova is open source.** If shaving allocations off a JSON hot path is your
+> idea of a good afternoon, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+### 5. Cheaper signal checking
+
+To stay cancellable, serialization checks for pending signals every
+`SIGNAL_CHECK_INTERVAL = 1000` elements. That's already sparse, but the
+`element_count += 1` and modulo run *per element*. For any response under 1000
+elements — the overwhelming majority of API payloads — the check never fires and
+the bookkeeping is pure overhead. Two options: skip the increment when the total
+element count is already bounded by the dict/list size hint, or just raise the
+interval to 4096. The user-facing latency of a non-cancellable serialization is
+still sub-millisecond either way. This one only earns its place if it shows up in
+a profile after the rest lands.
+
+### 6. Compression tuning (a separate axis)
+
+The JSON Compressed score is 21.0 — the low one — which smells like the encoder
+being re-initialized per request and/or running at too high a level. To
+investigate: reuse a `flate2`/`brotli` encoder per worker instead of
+constructing one per request; for brotli, level 4–5 is the throughput/ratio
+sweet spot and level 11 is a trap; and stream the encoder into the response
+buffer rather than compressing the full body after serialization. This touches
+the response pipeline, not the serializer, so it's a separate PR.
+
+## What's explicitly out of scope
+
+Two things I'm *not* doing in this pass, because they're invasive and not yet
+justified by real workloads:
+
+- **Serializing without the GIL.** The writer walks the Python tree under the
+  GIL, so a 100 MB dict response stalls the sub-interpreter for tens of
+  milliseconds — bad for tail latency. Fixing it means either deep-copying the
+  tree into an `Arc<JsonNode>` and serializing after `py.detach()`, or
+  periodically detaching mid-walk. Both complicate circular detection and path
+  tracking. Defer until we actually see >1 MB JSON responses.
+- **Full simd-json / sonic-rs integration.** After step 1 we emit bytes
+  directly, so `sonic_rs::to_vec` is already gone from the path. There may still
+  be a win from borrowing its number formatter or escape routine as building
+  blocks — evaluate that after step 1, not before.
+
+## Validation gate
+
+Every step ships behind the same checks: `benchmarks/run_comparison.sh` against
+FastAPI, the TechEmpower JSON / JSON Compressed / JSON TLS subscores, a new
+microbench at 1 KB / 100 KB / 10 MB payloads (throughput *and* p99), and all 65
+JSON correctness tests passing unchanged. That last one is the point — the whole
+plan is predicated on the claim that the middle tree was a convenience, not a
+requirement. If a correctness test goes red, that claim was wrong and the change
+doesn't ship. The tree comes out; the guarantees stay in.

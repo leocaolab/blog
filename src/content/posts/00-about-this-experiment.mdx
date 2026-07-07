@@ -1,0 +1,62 @@
+---
+title: "About this series: a hardcore project with zero human-written code"
+description: "Pyronova is a multi-core Python web server in Rust. It's also an experiment: can an AI pipeline build a benchmark-driven systems-optimization project end to end, with no human writing code? Two goals, stated up front."
+date: 2026-07-07
+tags: [python, rust, sub-interpreters, ai, performance]
+series: "pyre"
+seriesOrder: 0
+draft: false
+---
+
+This series is the engineering story of **Pyronova** — a Python web server built
+in Rust that runs many CPython sub-interpreters in one process to get real
+multi-core Python. But before the first benchmark, an honest disclosure about
+what this project actually is, because it changes how you should read everything
+that follows.
+
+It was two experiments at once: **high performance**, and **pure AI**.
+
+## Goal 1 — high performance: validate sub-interpreters
+
+Python's oldest complaint is the GIL: one lock, one core of Python per process.
+There's a newer, less-travelled answer than "remove the GIL" — **multiply** it.
+**PEP 684** gave each sub-interpreter its own GIL (shipped in Python 3.12), and
+**PEP 734** put a real `interpreters` module in the standard library (3.14). N
+interpreters in one process, each isolated, each on its own core.
+
+It's a real, open systems question: can you actually build a *production-shaped*
+web server on this — raw CPython C-API, a Rust HTTP stack, thread-per-core,
+zero-copy paths — and land near pure-Rust throughput? Most of the writing on
+sub-interpreters stops at toy examples. We wanted to push it to the wall.
+
+## Goal 2 — pure AI: zero human code
+
+Here's the part to say out loud, at the start: **we didn't write the code.**
+
+Every line of Rust, every unsafe FFI call into the CPython C-API, every
+optimization, every benchmark harness — and every post in this series, including
+this one — was produced by an AI pipeline. No human hand-wrote a function, tuned
+an allocator, or hand-authored a paragraph. It's vibe programming taken to its
+logical end: a human sets direction and reads results; the AI does the building.
+
+We picked this project *specifically* because it's hard. Hardcore performance
+optimization is about the least forgiving thing you can ask an AI to do — it's
+not CRUD, it demands deep systems knowledge, `unsafe` correctness, real
+measurement, and relentless iteration. It's exactly the kind of work nobody has
+seriously challenged an AI to carry end to end. So we did, and wrote down what
+happened.
+
+## How to read this
+
+Read it on two levels: as the story of a genuinely fast Python server, and as a
+field report on what AI can and can't do at the hard end of systems programming.
+
+We're not going to pretend it was flawless. Somewhere in this series the AI
+confidently drew a wrong conclusion from a benchmark — and it took a human asking
+"are you sure?" plus a fresh experiment to catch it. That episode is in here,
+unedited, because it's the most useful thing in the whole project. The
+retrospective at the end has the verdict on both goals — including why we've
+paused, and what we're doing about the one problem AI-built code reliably has.
+
+The rest is engineering. Let's start with the problem that made any of this worth
+building.

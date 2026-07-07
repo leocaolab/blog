@@ -1,0 +1,76 @@
+---
+title: "From Pyre to Pyronova: a clean break and what's next"
+description: "Closing a 40-post build log: why the project renamed itself with no alias, what it decided not to be, and the roadmap it hasn't shipped yet."
+date: 2026-07-07
+tags: [python, rust, sub-interpreters, architecture, gil]
+series: "pyre"
+seriesOrder: 40
+draft: false
+---
+
+This is the last post in the series, so let me close two loops: why the project you've been reading about under two different names changed the first one, and where it's going now that the build log ends.
+
+The short version of the whole arc: it started as the HTTP layer for a demanding Python backend that needed C++-class throughput with Python's ecosystem, hit the wall every Python server hits — one GIL, one core — and made an unusual bet. Instead of multiprocessing (bloat) or free-threading (a refcount tax on every object op), it chose to **multiply the GIL**: N CPython sub-interpreters in one process, each with its own GIL under PEP 684. PyO3 refuses sub-interpreters, so the project dropped to the raw CPython C-API, landed within a few percent of pure-Rust Axum, spent months hardening the memory model, and came out with the honest head-to-head numbers from the last two posts. That's the story. It shipped under the name **Pyre** for its entire 1.x life.
+
+Then it stopped being Pyre.
+
+## Why rename at all
+
+"Pyre" collided with Meta's Pyre — a widely-used Python type checker. For a Python tool to share a name with another well-known Python tool is not a minor branding wrinkle; it's a permanent tax on every search, every "have you tried Pyre?", every GitHub result that turns out to be the other project. The name was actively working against discovery, and no amount of good engineering fixes a name that points at someone else's repo.
+
+So at **v2.0.0** the project became **Pyronova**. The name keeps the fire theme, and it encodes what the thing actually is: **Py**thon + **R**ust + **nova** — the explosive-newness bit. It was free on PyPI and had a single collision on GitHub, which is about as clean as a name gets in 2026. Beyond that I'll spare you the naming-committee archaeology; the useful part is the decision, not the shortlist.
+
+## A clean break, on purpose
+
+The interesting engineering choice wasn't the name — it was refusing to soften the transition. v2.0.0 is a rename-*only* release: no behavioral changes, and critically, **no compatibility alias**. There is no `import pyre` shim that forwards to `pyronova`. The old import surface is simply gone:
+
+```python
+# before
+from pyreframework import Pyre
+
+# after
+from pyronova import Pyronova
+```
+
+Everything moved in one pass — the PyPI package (`pip install pyronova`), the main class, the CLI (`pyronova run/dev/routes`), every environment variable (`PYRE_*` → `PYRONOVA_*`), the Rust crate, even the log target names and the FFI symbols injected into sub-interpreter globals. Type names lost their prefix in the same motion: `PyreRequest` and `PyreResponse` became plain `Request` and `Response`, FastAPI-style.
+
+Leaving a compatibility shim behind is the "省事" path — the one that saves everyone a migration afternoon. It's also the path that leaves you maintaining two names forever, with a deprecation warning nobody reads and a fallback nobody tests. A clean break costs downstream users one mechanical find-and-replace:
+
+```bash
+git grep -l pyreframework | xargs sed -i 's/pyreframework/pyronova/g'
+git grep -l PYRE_ | xargs sed -i 's/PYRE_/PYRONOVA_/g'
+# type names lost their prefix — handle per-class
+git grep -l PyreRequest | xargs sed -i 's/PyreRequest/Request/g'
+```
+
+One afternoon of `sed` versus years of a shim you have to keep alive: take the clean structure. Every merge should either commit to the new shape or keep the old one — not both, held together with a compatibility layer nobody wants to own.
+
+There's one deliberate exception, and it's about honesty rather than cleanliness. The historical benchmark reports, memory-leak investigations, and incident post-mortems in the repo were **not** renamed. When those events happened the framework was called Pyre, and rewriting the record to pretend it was always Pyronova would be dishonest. The code moved on; the history stays true to what it was.
+
+> **Pyronova is open source.** New name, same engine — find it on GitHub at [leocaolab/pyronova](https://github.com/leocaolab/pyronova). Star it if per-core Python interests you, or grab it with `pip install pyronova`.
+
+## What it decided not to be
+
+Forty posts of "here's what we built" is only half the identity. The other half is the anti-goals — the things Pyronova looked at and chose to skip, because a design is defined as much by its refusals.
+
+**No free-threading as the primary bet.** No-GIL Python (PEP 703) removes the lock but makes every object operation pay for atomic reference counting, and most of the C-extension ecosystem still assumes the GIL exists. Removing the lock trades one problem for another. Multiplying the GIL keeps single-threaded interpreter semantics — the fast, well-understood ones — and just gives each core its own.
+
+**No OpenAPI / browser-explorer surface.** Pyronova targets high-throughput APIs and AI agents, not a Swagger UI. For both machine and human contracts, Pydantic models and type stubs carry the guarantees a Swagger page would — typed and checked at the source instead of rendered in a browser. That's a genuine narrowing of scope, and it's a choice, not a gap we're apologizing for.
+
+**No hidden compromises in the perf claims.** You saw it in the last two posts — Actix beats us on baseline, pipelined, json, and async-db, and we printed those losses next to the wins. An honest scoreboard is worth more than a cherry-picked one, because the wins only mean something if you believe the losses would have been reported too.
+
+## What's next
+
+The series ends here, but the project doesn't. A few things are genuinely on the roadmap and genuinely *not shipped yet* — I'm listing them as intentions, not accomplishments:
+
+- **An io_uring engine on Linux.** The current server sits on Tokio + Hyper. A `monoio`-style io_uring backend could shave the syscall overhead on the accept-and-respond path where, at very high per-core request rates, the kernel boundary starts to dominate. This is gated on real multi-core benchmark data before committing the effort — no point optimizing a layer that isn't the ceiling.
+- **Native gRPC.** The Rust side already speaks HTTP/2; a `tonic`-based gRPC surface is a natural extension for service-to-service backends that want more than JSON-over-HTTP.
+- **Upstreaming sub-interpreter support to PyO3.** The whole project exists because PyO3 refuses sub-interpreters, forcing the drop to raw FFI. The right long-term fix isn't a private fork — it's helping PyO3 support the per-interpreter-GIL world upstream, so the next person who wants N interpreters in one process doesn't have to hand-manage refcounts across thread boundaries the way we did.
+
+None of those are done. When they are, they'll have their own honest benchmark posts — losses included.
+
+## The one-sentence version
+
+If you only remember one thing from forty posts: the GIL is not Python's ceiling, it's Python's *default*, and you can multiply it. Pyronova is what that bet looks like carried all the way through — raw C-API sub-interpreters, a hand-verified memory model that survives 120 million requests flat, head-to-head numbers that concede the hot path to pure Rust and win where the engineering is ours to win, and a name that finally points at its own repo.
+
+Thanks for reading the build log. The code is open; go break it.

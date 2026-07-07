@@ -1,0 +1,217 @@
+---
+title: "The three-day memory leak that wasn't where we looked"
+description: "Chasing a ~1 KB/req sub-interpreter leak through three plausible wrong answers before a 40-line C program proved the cause was cross-thread PyThreadState reuse."
+date: 2026-07-07
+tags: [memory, debugging, sub-interpreters, python, rust, gil]
+series: "pyre"
+seriesOrder: 35
+draft: false
+---
+
+A Python service under sustained load was getting OOM-killed. Once RSS started
+climbing it went on a straight line and didn't stop until the kernel reaped it.
+Restart, repeat. The trigger was specific: a long-running sub-interpreter
+deployment taking real request traffic, where every request has a worker thread
+attach and detach a CPython thread-state. Hold *that* path under continuous load
+long enough and it walked into an OOM — which is exactly why short runs and
+bursty traffic never showed it.
+
+The service was running on Pyronova, our Rust web server that hosts N CPython
+sub-interpreters in one process (one per core, each with its own GIL under PEP
+684). The leak was specific to that dispatch path. Flip the same workload to
+single-GIL mode and RSS held flat forever. So the bug lived somewhere on the
+sub-interpreter boundary — the one part of CPython that almost nobody exercises
+under sustained load.
+
+It took three days. It should have taken three hours. The reason it didn't is
+the whole point of this post: we spent two of those days fixing real bugs that
+were not the leak.
+
+## Establishing the shape
+
+First rule of a leak hunt: quantify before you theorize. We ran the same
+plaintext route under `wrk` in repeated iterations and sampled RSS between
+them. The growth was **monotonic** — it survived the cooldown between load
+bursts, which immediately killed the "it's just buffered backpressure draining
+slowly" theory. Buffers drain when load stops. This didn't.
+
+The rate came out to roughly **0.75–1 KB per request** at 400k rps, on that
+sustained dispatch path. Per request that's small. But driven flat out — 400k
+rps — it's on the order of **400 MB/s** of memory you never get back, so a box
+pinned at that load walks into an OOM in short order. Small per-unit leaks at
+high throughput are the worst kind: invisible in a unit test, invisible in a
+short soak, lethal in a long-lived deployment.
+
+An A/B on interpreter mode nailed down the coordinate: **single-GIL mode did
+not leak at all**. Sub-interpreter mode leaked ~0.75–1 KB/req. From here the bug had
+to involve something CPython does differently across the sub-interpreter
+boundary.
+
+## Red herring #1: the drop that silently no-op'd
+
+Our first real find felt like *the* find. Pyronova wraps every borrowed
+CPython pointer in an RAII guard whose `Drop` calls `Py_DECREF`. But the drop
+was gated like this:
+
+```rust
+if ffi::PyGILState_Check() != 1 {
+    tracing::error!("dropped without GIL — leaking pointer");
+    return; // leak is better than a crash
+}
+ffi::Py_DECREF(self.ptr);
+```
+
+Here's the trap: the entire `PyGILState_*` family is hardcoded to the **main
+interpreter's** thread-state slot. Inside a sub-interpreter, `PyGILState_Check()`
+returns `0` even when that sub-interpreter's own GIL is firmly held. So on
+every request, in every worker, `Py_DECREF` was being *skipped*. A guaranteed
+leak, right there in black and white.
+
+We swapped it for a sub-interpreter-aware probe — a thread-state is attached
+iff you're inside *some* interpreter's GIL scope:
+
+```rust
+if ffi::PyThreadState_GetUnchecked().is_null() {
+    return;
+}
+ffi::Py_DECREF(self.ptr);
+```
+
+Then we instrumented both branches and ran a 10-second bench: ~21 million drops,
+and only 16 hit the "leak" branch — all at startup. Every per-request drop now
+genuinely called `Py_DECREF`.
+
+**And the leak didn't move.** The check had been architecturally wrong for
+sub-interpreters and we were right to fix it. It just wasn't the leak. That is
+the trap of a real bug: it's satisfying to fix, it's obviously correct, and it
+convinces you you're done.
+
+## Red herring #2: the call that "leaked its arguments"
+
+With `Py_DECREF` now firing reliably, we snapshotted live objects. Thousands of
+request objects still alive, each `refcount == 1`, and `gc.get_referrers()`
+returned nothing after subtracting our probe's own list. One C-level reference,
+held forever, with no Python owner.
+
+The one C-level owner we build per request was the argument tuple handed to the
+handler. So we replaced the heap-tuple call with a stack-based vectorcall:
+
+```rust
+// before: PyObject_Call builds and owns a heap tuple
+let args = [request_obj.as_ptr()];
+let result = ffi::PyObject_Vectorcall(func, args.as_ptr(), 1, null_mut());
+```
+
+Live request objects after a bench dropped from *thousands* to essentially
+zero. It genuinely helped — vectorcall skips a per-request tuple allocation and
+is strictly faster, so it stayed. But watch the pattern: the RSS line bent, it
+didn't flatten. We'd knocked out one *symptom* and found another underneath.
+
+## Red herring #3: clearing the dict by hand
+
+Underneath the request objects were their dicts — headers and params — still
+accumulating. This led us down the deepest rabbit hole: a hypothesis that
+CPython sub-interpreters under PEP 684 don't reliably run finalizers, so a
+dict's own `tp_dealloc` wasn't decref'ing its contents. So we did it ourselves,
+by hand, while holding the sub-interpreter GIL — iterate the dict, DECREF each
+value, then clear.
+
+That cut the leak roughly in half. Which, again, *felt* like progress. We wrote
+an RAII `SlotClearer` guard, added a `PyDict_Clear`, cleared pending exceptions
+between C calls. Every one of those was a defensible piece of framework
+hardening. Several of them are still in the codebase because they cover
+early-return paths that would otherwise skip cleanup.
+
+But we were now three fixes deep and the RSS line still had a slope. Every fix
+lowered the number and none of them zeroed it. That is the signal — in
+retrospect, screaming — that you are treating symptoms. We kept finding a real
+leak, patching it, and finding the same-shaped leak one layer down. When the
+same delta-debug map keeps pointing at "creating and freeing an object in a
+sub-interpreter costs ~200 bytes no matter what you put in it," the object
+isn't the problem. The *thread it's being freed on* is.
+
+> **Pyronova is open source.** The tstate fix and the whole sub-interpreter engine are on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). If chasing bugs like this is your idea of fun, ⭐ it, or install it with `pip install pyronova`.
+
+## Deleting Python from the picture
+
+The mistake tying all three red herrings together was that every experiment
+still ran inside Pyronova — Rust, tokio, hyper, our own FFI, all confounding
+variables. The fix was to throw all of it away and reproduce the leak in pure
+C, varying exactly one thing: **which OS thread does the work.**
+
+```c
+// Program B: create the sub-interp on the main thread,
+// run the request loop on a *worker* pthread.
+static PyThreadState *g_tstate;   // created on main thread
+
+void *worker(void *arg) {
+    for (int i = 0; i < N; i++) {
+        PyEval_RestoreThread(g_tstate);   // attach creator tstate here
+        PyObject *o = PyDict_New();       // trivial per-"request" work
+        Py_DECREF(o);
+        g_tstate = PyEval_SaveThread();   // detach
+    }
+    return NULL;
+}
+```
+
+Three variants, RSS sampled per iteration:
+
+```
+A. sub-interp created on main thread, work loop on main thread   →   0 B/iter
+B. sub-interp created on main thread, work loop on a pthread      → 997 B/iter
+C. worker calls PyThreadState_New(interp) first, then loops       →   0 B/iter
+```
+
+There it was, isolated from every framework variable. A sub-interpreter's
+`PyThreadState` carries **per-OS-thread** bookkeeping — GIL reacquisition
+counters, TLS caches, finalizer tracking. When the thread that attaches a
+tstate is not the thread that *created* it, that bookkeeping accumulates and is
+never reclaimed. ~1 KB every attach/detach cycle.
+
+And Program A — clean — is *exactly* why our earlier "let me repro this in C"
+attempts had exonerated CPython. They all ran on the main thread. The one
+variable that mattered was the one we'd been holding constant.
+
+## The 13-line fix
+
+Pyronova created each sub-interpreter on the main thread during boot, then
+handed it to a worker thread to run requests forever. Textbook Program B. The
+fix is to give each worker its *own* tstate, created on its own thread:
+
+```rust
+// rebind_tstate_to_current_thread — called once per worker at loop start
+unsafe fn rebind_tstate_to_current_thread(interp: *mut ffi::PyInterpreterState) {
+    ffi::PyEval_RestoreThread(creator_tstate);      // 1. enter the sub-interp
+    let fresh = ffi::PyThreadState_New(interp);      // 2. tstate bound to THIS thread
+    ffi::PyThreadState_Swap(fresh);                  // 3. make it current
+    ffi::PyThreadState_Clear(creator_tstate);        // 4. dispose the creator tstate
+    ffi::PyThreadState_Delete(creator_tstate);
+    ffi::PyEval_SaveThread();                         // 5. release GIL, keep `fresh`
+}
+```
+
+Every subsequent attach/detach is now thread-local. Program C, in Rust.
+
+The result: **73.8 million requests at 410k rps over 180 seconds, total RSS
+growth of 4 MB — 0.057 B/req**, below `/proc` sampling noise. Flat. The line
+that had killed the service in ten minutes was gone.
+
+Two things fell out of it. Python `__del__` / `tp_finalize` now fire correctly
+in sub-interpreter handlers — that had been silently broken the whole time (the
+finalizer bug we'd blamed on PEP 684 was really the same broken tstate). And
+because `PyThreadState_New`-based rebinding leans on APIs stabilized in 3.13,
+Pyronova's minimum is now **Python 3.13+**. A memory bug set the language floor
+for the entire project.
+
+## What I'd tell past me
+
+The lesson isn't "don't fix bugs." Every one of those three fixes was a real
+bug; two of them shipped. The lesson is about *reading the slope*. When each
+fix lowers a leak but never zeroes it, and the residual has the same shape no
+matter what you change about the payload, stop patching the payload. The
+constant isn't in the object. It's in the environment the object lives in.
+
+And when the framework is in the way of seeing that: delete the framework.
+Forty lines of C that vary exactly one thing beat three days of instrumented
+production benchmarks that varied everything at once.

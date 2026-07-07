@@ -1,0 +1,128 @@
+---
+title: "Threads lie, processes bloat, interpreters isolate"
+description: "Sub-interpreters vs OS threads vs multiprocessing — the three ways to parallelize Python, and the I/O-versus-CPU math that decides which one you actually need."
+date: 2026-07-07
+tags: [python, gil, sub-interpreters, benchmarks, architecture, memory]
+series: "pyre"
+seriesOrder: 6
+draft: false
+---
+
+There are exactly three ways to make Python use more than one core, and each one
+lies to you differently. Threads promise parallelism and don't deliver it.
+Processes deliver it and bill you in RAM. Sub-interpreters split the difference —
+and whether that's the right call comes down to one question about your workload
+that most people never actually measure.
+
+Let me lay out the three honestly, then do the math.
+
+## Threads lie
+
+OS threads are the intuitive answer, and for CPU-bound Python they're a trap.
+Every thread in a process shares one interpreter and one GIL, and the GIL admits
+exactly one thread to run Python bytecode at a time. You can spawn sixteen
+threads on a sixteen-core box and watch them take turns on a single core. The
+concurrency is real; the *parallelism* is a fiction the scheduler maintains.
+
+Threads aren't useless — they're fine for I/O, where a blocked thread releases
+the GIL and lets another run. But if your goal is "use all my cores for Python
+compute," threads are the option that looks like it should work and doesn't.
+
+## Processes bloat
+
+`multiprocessing` (and its production cousins, `gunicorn -w N` /
+`uvicorn --workers N`) is the answer everyone reaches for next, and it genuinely
+works: N processes, N interpreters, N GILs, N cores. Full isolation, immune to a
+peer's corruption. It's the honest way to get parallel Python today.
+
+The bill arrives as memory and operational complexity. Each process is a full
+Python runtime with its own copy of everything. Concretely, on the same
+workload:
+
+| Metric | Single process, N sub-interpreters | 22-process multiprocessing server |
+|--------|-----------------------------------|-----------------------------------|
+| Memory | ~67 MB | ~447 MB |
+| Inter-worker comms | none — shared address space | IPC overhead |
+| Shared state | naturally shared | needs Redis / shared memory |
+| Deploy surface | 1 process | 22 processes to coordinate |
+
+That's roughly a **6.7× memory difference** for the same core count, plus the
+standing cost of IPC and process coordination. For fully independent batch jobs,
+that's a fine trade. For a web server where you'd like shared caches and one set
+of metrics, it's pure overhead.
+
+## Interpreters isolate
+
+Sub-interpreters sit between the two. Since Python 3.12 (PEP 684) each
+sub-interpreter has its own GIL, so N of them run Python in parallel — like
+processes — but they share one address space and one binary, so they start
+cheaper (no fork, no exec) and cost a fraction of the memory. And they're
+isolated enough to recover from failure: kill a stuck interpreter and its
+neighbours keep serving.
+
+The three models line up like this:
+
+- **Sub-interpreters (PEP 684, 3.12+):** many isolated runtimes in one process,
+  each with its own GIL. Best for parallel server-style work where isolation is a
+  feature.
+- **Free-threading (PEP 703, 3.13+ experimental):** one interpreter, no GIL,
+  shared memory. Best for shared-memory parallel compute — but experimental, and
+  it taxes single-threaded performance.
+- **`multiprocessing`:** many OS processes. Best for fully independent work where
+  IPC cost is acceptable.
+
+> **Pyronova is open source** — it commits to the interpreters-isolate corner so you
+> don't have to wire it up yourself. If per-core Python interests you, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The math nobody does
+
+Here's the part that should decide your architecture, and usually doesn't: **is
+your workload actually CPU-bound?**
+
+Because parallelism only helps CPU-bound code. I/O-bound work — database queries,
+HTTP calls, cache lookups, file reads — already releases the GIL during the
+system call. Giving it more GILs buys almost nothing; it was never the
+bottleneck.
+
+Post 01 breaks down where a typical backend actually spends its time — roughly
+95% I/O, 4% light CPU, 1% heavy CPU — and walks through the LLM chat handler that
+burns ~2025 ms on the network and under 1 ms on CPU. The heavy-CPU sliver is the
+only part that benefits from true multi-core Python, and it's a sliver. Throw
+multiprocessing at an I/O-bound handler and you don't make the LLM answer faster;
+you just multiply the memory footprint while everything waits on the network.
+What that handler needs is *concurrency* — thousands of requests in flight, each
+parked on an `await` — not parallel CPU.
+
+## When processes genuinely win — and why that's fine
+
+Honesty cuts both ways, so here's a case where multiprocessing beats
+sub-interpreters outright: a numpy `mean` over 10k elements, where the 22-process
+server wins by 3.7× (post 01 has the numbers). The reason is physics,
+not cleverness: numpy's `_multiarray_umath` module refuses to load in more than
+one sub-interpreter per process, so numpy work is forced onto the *single* main
+interpreter — one core, serial — while the 22-process server has 22 real numpy
+runtimes going at once. When a heavy-CPU C extension can't live in a
+sub-interpreter, processes are the only way to parallelize it today.
+
+But notice what that costs and what it's for: it's the 1% heavy-CPU sliver, and
+you paid 6.7× memory across *every* request to serve it. The better architecture
+keeps heavy compute out of the web tier entirely — background workers, a
+compute service, or a GIL-releasing library like Polars (Rust under the hood,
+drops the GIL during aggregation, so it never blocks the request loop) — and lets
+the web layer do what it's actually bound on: I/O.
+
+## The takeaway
+
+Pick by your bottleneck, not by reflex:
+
+- **CPU-bound, C-extension-safe, all in-process:** sub-interpreters. Parallel and
+  cheap.
+- **CPU-bound, stuck on a GIL-only C extension (numpy today):** multiprocessing,
+  or move the compute off the web tier.
+- **I/O-bound (most web and AI backends):** you needed async concurrency all
+  along; parallelism was never the constraint.
+
+Threads lie about parallelism. Processes tell the truth but bloat. Sub-interpreters
+give you parallel Python at a seventh of the memory — as long as you're honest
+about whether you needed parallel Python in the first place.

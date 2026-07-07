@@ -1,6 +1,7 @@
 ---
 import { getCollection, render } from "astro:content"
 import BaseLayout from "../../layouts/BaseLayout.astro"
+import { SERIES } from "../../consts.ts"
 
 export async function getStaticPaths() {
   const posts = await getCollection("posts", ({ data }) => !data.draft)
@@ -33,6 +34,10 @@ const nextPart =
   seriesIndex >= 0 && seriesIndex < seriesParts.length - 1
     ? seriesParts[seriesIndex + 1]
     : null
+const seriesTitle = post.data.series
+  ? (SERIES as Record<string, { title: string }>)[post.data.series]?.title ??
+    "Series"
+  : "Series"
 ---
 
 <BaseLayout
@@ -78,7 +83,8 @@ const nextPart =
       seriesParts.length > 1 && (
         <nav class="series-toc" aria-label="Series contents">
           <p class="series-label">
-            Series · Part {seriesIndex + 1} of {seriesParts.length}
+            <a href={`/series/${post.data.series}/`}>{seriesTitle}</a> · Part{" "}
+            {seriesIndex + 1} of {seriesParts.length}
           </p>
           <ol>
             {seriesParts.map((p) => (

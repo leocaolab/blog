@@ -1,0 +1,133 @@
+---
+title: "The spawn_blocking trade: −34% throughput for +535% I/O"
+description: "Moving Python handlers onto spawn_blocking cost 34% on a synthetic GIL-Hello benchmark and won 535% on real sleep-based I/O. Here's why that's the right trade."
+date: 2026-07-07
+tags: [python, rust, gil, async, performance, benchmarks]
+series: "pyre"
+seriesOrder: 18
+draft: false
+---
+
+Here's a benchmark result that looks, on its face, like a regression you should
+revert:
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| GIL Hello World | 119,049 | 77,853 | **−34%** |
+
+We shipped it anyway. On purpose. Because the same change produced this on the
+very next row:
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| GIL sleep(1ms) | 7,354 | 46,704 | **+535%** |
+
+This is a post about why −34% on a number that doesn't matter is worth +535% on
+a number that does — and about how a synthetic benchmark can talk you out of the
+right architecture if you let it.
+
+## The setup
+
+Pyronova runs Python across N CPython sub-interpreters, each with its own GIL
+(PEP 684). But it also has a **GIL mode**: a single shared interpreter, for
+handlers that call C extensions which can't survive in sub-interpreters — NumPy,
+Pandas, Pydantic-core, and friends. GIL mode is the compatibility escape hatch.
+
+The problem is where GIL-mode Python *runs*. Pyronova's HTTP layer is Hyper on
+Tokio — a fixed pool of async worker threads driving epoll. If a Python handler
+runs directly on a Tokio worker, then every millisecond that handler spends
+holding the GIL — or worse, blocked in `time.sleep`, a database round-trip, or
+a socket read — is a millisecond that Tokio worker cannot poll any other
+connection. One slow handler stalls every request queued behind it on that
+thread. That's the cardinal sin of async runtimes: **blocking the executor.**
+
+The fix is Tokio's `spawn_blocking`: move the Python call onto a dedicated
+blocking-thread pool so the Tokio workers stay free to keep polling sockets.
+The v0.4.0 round shipped exactly that, alongside bounded-channel backpressure
+(returning 503 instead of OOMing), TCP_NODELAY, and orjson auto-detection.
+
+Test rig: macOS ARM64 (Apple Silicon), Python 3.14.3, Rust 1.93.1, wrk 4.2.0,
+`wrk -t4 -c256 -d10s` after a warmup.
+
+## What the trade actually costs
+
+`spawn_blocking` isn't free. Handing work to another thread pool means one extra
+thread hop per request: the Tokio worker packages the call, wakes a blocking
+thread, that thread runs Python, then hands the result back. On a handler that
+does *nothing* — `return "hello"` — that hop is pure overhead with no benefit,
+because there was never anything to block on:
+
+| Metric | Round 1 | Round 2 | Change | Cause |
+|--------|---------|---------|--------|-------|
+| GIL Hello World | 119,049 | 77,853 | −34% | One extra thread switch per request |
+| GIL sleep(1ms) | 7,354 | 46,704 | +535% | No longer blocks Tokio workers |
+| GIL numpy mean | 8,419 | 8,290 | −1.5% | numpy is CPU-bound; nothing to unblock |
+| SubInterp Hello | 219,210 | 211,019 | −3.7% | Normal fluctuation |
+| Hybrid Hello | 217,610 | 216,674 | −0.4% | Unaffected |
+
+Read that table carefully, because it's the whole argument.
+
+GIL-Hello loses 34%. That's the thread-hop tax, laid bare with zero I/O to hide
+behind. It is the *worst possible case* for the change — a handler so trivial
+that the overhead is 100% of the cost.
+
+GIL-sleep gains 535%. A 1ms sleep is the *simplest possible stand-in for real
+I/O*: a handler that waits. Before the change, each sleeping handler pinned a
+Tokio worker doing nothing for a full millisecond, and throughput collapsed to
+7k. After, the Tokio workers keep polling while the blocking pool absorbs the
+waits, and throughput jumps to 47k.
+
+And critically — the sub-interpreter and Hybrid paths don't move at all
+(−3.7% and −0.4%, both inside variance). They use the channel worker pool, not
+`spawn_blocking`, so they bypass the trade entirely. This cost is scoped to GIL
+mode alone.
+
+> **Pyronova is open source.** If trading 34% on a fiction to win 535% on real I/O
+> is the sort of call you'd make too, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## Why GIL-Hello is a lie (a useful one)
+
+The instinct is to defend the 119k number. It's the biggest number on the
+board! Reverting the change buys it right back!
+
+But ask what workload GIL-Hello actually represents: a route that acquires the
+GIL, does no I/O, does no meaningful compute, and returns a constant. That
+workload does not exist in production. If your handler genuinely does nothing,
+you'd put it on the sub-interpreter path (which does 211k anyway) and never
+touch GIL mode. GIL mode exists *specifically* for handlers that call into C
+extensions and do real work — database queries, model inference, file reads —
+and every one of those workloads either blocks on I/O or is CPU-bound.
+
+- **Blocks on I/O** → `spawn_blocking` is a massive win (the 535%).
+- **CPU-bound in a C extension** (numpy) → −1.5%, statistical noise, because
+  there's nothing to unblock and the GIL is held either way.
+
+So GIL-Hello is measuring the one thing GIL mode will never be asked to do. It's
+a microbenchmark that rewards the wrong architecture. Optimizing for it would
+mean building a server that's fastest at returning constants and worst at
+serving real requests.
+
+## The general principle
+
+This is the trap with synthetic benchmarks, stated plainly: **the cheapest
+possible handler makes fixed per-request overhead look enormous, because
+there's no real work to amortize it against.** A thread hop that's 34% of a
+`return "hello"` is a rounding error on a handler that queries Postgres. The
+benchmark that punishes `spawn_blocking` hardest is precisely the benchmark
+least like production.
+
+The right lens isn't "which change makes the biggest number bigger." It's
+"which change makes the *realistic* workloads faster, and what does that cost on
+the *unrealistic* ones." Here:
+
+- Real I/O handlers: **+535%.**
+- CPU-bound C-extension handlers: **flat.**
+- Empty handlers that don't exist in production: **−34%.**
+- The entire sub-interpreter hot path: **untouched.**
+
+In a real web application, handlers inevitably involve I/O — a database, a
+network hop, a file. `spawn_blocking` keeps the async runtime healthy under
+exactly that load. Trading 34% on a fiction to win 535% on the reality isn't a
+close call. It only *looks* like one if you let the microbenchmark pick the
+scoreboard.

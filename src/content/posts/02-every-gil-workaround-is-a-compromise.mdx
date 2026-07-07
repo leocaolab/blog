@@ -1,0 +1,119 @@
+---
+title: "Every GIL workaround is a compromise"
+description: "FastAPI's async loop, Robyn's process fan-out, and PEP 703 free-threading — what each one actually buys you, and the exact bill it hands you back."
+date: 2026-07-07
+tags: [python, gil, async, sub-interpreters, architecture]
+series: "pyre"
+seriesOrder: 2
+draft: false
+---
+
+The Global Interpreter Lock is a single mutex around the CPython interpreter: only one
+thread executes Python bytecode at a time. One lock, one core. Everything the Python world
+has built to get more than one core out of a single service is, at bottom, a workaround for
+that sentence — and every workaround is a real engineering trade with a real bill attached.
+
+I want to lay the three main ones side by side and be precise about both halves: what each
+buys, and what it costs. Not to dunk on them — they're all reasonable answers to an
+unreasonable constraint — but because you can't appreciate the sub-interpreter approach
+until you've felt where the others pinch.
+
+## Workaround 1: async on a single core (FastAPI, and friends)
+
+**What it buys.** An event loop turns one thread into a machine for I/O concurrency. While
+one request is parked on `await db.query()`, the loop runs another. A single core can keep
+thousands of connections in flight, because I/O-bound work already releases the GIL during
+the system call — the loop just makes that releasing explicit and orderly. For the LLM
+gateway from the previous post — where a request is 2000 ms of waiting and under 1 ms of
+CPU — this is close to ideal.
+
+**What it costs.** It is still one GIL on one core. Async gives you *concurrency*, never
+*parallelism*. The instant a single request does CPU work — a big JSON parse, Pydantic
+validation, a numpy reduction — it holds the one thread and every other in-flight request
+stalls behind it. There's no preemption; a slow synchronous call inside a coroutine blocks
+the whole loop.
+
+And to use a second core you leave the model entirely: you run Gunicorn/uvicorn with N
+worker processes. Now you've quietly adopted Workaround 2 on top, with N full copies of the
+interpreter and your modules resident in memory. On a plain-JSON baseline a single async
+worker measures around 9,000 req/s. That's the FastAPI row from the previous post's
+scorecard: one process, one GIL, fast I/O, slow CPU.
+
+## Workaround 2: multiply the processes (Robyn, Gunicorn `-w N`)
+
+**What it buys.** This is the honest, brute-force answer, and it genuinely works. N OS
+processes are N independent interpreters with N independent GILs. That is true multi-core
+parallelism, CPU-bound work included — no asterisks. Robyn goes further and puts a Rust
+(actix-web) I/O core under the Python handlers, so the socket layer is fast too. Run
+`--fast` and you get 22 processes chewing through requests on every core. In a pure numpy
+microbenchmark this design wins outright — 22 real numpy runtimes beat a single-process
+design by 3.7× (post 01 has the figures) — precisely because 22 GILs is 22 GILs and numpy's
+C module won't load twice in one process anyway.
+
+**What it costs.** Memory, and everything that isn't shared. Each process is a full Python
+runtime with its own copy of every imported module. At 16 workers that's about 583 MB of
+resident memory; Robyn's 22-process mode lands in the hundreds of megabytes. On a 512 MB
+container you fit fewer workers than you wanted. Nothing is shared by default — a cache
+that used to be a `dict` now needs Redis and a network hop and a serialization format.
+State coordination, health, and deployment all now operate across N processes instead of
+one. You bought parallelism and paid in RAM and operational surface area — the Robyn row from the
+previous post's scorecard: brute force, 156k QPS, 583 MB.
+
+## Workaround 3: remove the lock (free-threading, PEP 703)
+
+**What it buys.** The most direct answer of all: delete the GIL. **PEP 703** ships a
+free-threaded build of CPython (experimental in 3.13+) with no interpreter lock at all,
+so ordinary threads run Python bytecode on every core while still sharing memory the way
+threads always have. It's the "have your cake and eat it" option — real parallelism *and*
+shared objects — and it's a serious, well-executed effort.
+
+**What it costs.** Removing the lock isn't free; it moves the cost into every object
+operation. Reference counting, which the GIL used to protect for free, now has to be atomic
+or otherwise synchronized, which makes single-threaded Python *slower* than it was. And the
+larger problem is the ecosystem: an enormous amount of C-extension code was written assuming
+the GIL exists and simply is not safe without it. You can flip the switch; you cannot flip
+your dependencies. For now it trades a parallelism problem for a compatibility-and-overhead
+problem.
+
+## The pattern
+
+Put them in a row and the shape is unmistakable:
+
+| Workaround | Buys you | Bill |
+|---|---|---|
+| Async single-core | I/O concurrency | No CPU parallelism; one slow call stalls the loop |
+| Multiprocessing | True CPU parallelism | N× memory; no shared state; IPC + coordination |
+| Free-threading (PEP 703) | Parallelism **and** shared memory | Slower per-object; C-extension ecosystem not ready |
+
+Async has concurrency but not parallelism. Processes have parallelism but not sharing.
+Free-threading has both but taxes single-thread speed and breaks compiled extensions. Each
+one gives you two of the three things you want — high I/O concurrency, real CPU
+parallelism, one cheap shared process — and takes the third away.
+
+> **Pyronova is open source** — the workaround that tries hard not to become a
+> compromise. If the trade-offs above sound familiar, ⭐ it on GitHub —
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The option that isn't on most people's list
+
+There's a fourth point in this space, and it's the one this series is built around:
+**sub-interpreters** — fully independent Python interpreters living inside one process, each
+with its own modules, globals, exception state, and reference-count bookkeeping. They're old,
+but **PEP 684** (shipped in Python 3.12) finally gave each one its *own* GIL, so N of them
+now execute genuinely parallel bytecode on multiple cores without a single extra OS process.
+It sits deliberately between the workarounds above:
+
+- Cheaper to start than a process — no `fork`, no `exec`, one binary, one set of file
+  descriptors.
+- Isolated enough to recover from a failure — a leak or a crash in one interpreter is
+  bounded to that interpreter's arena, not the whole process.
+- Actually parallel for CPU-bound Python — N interpreters, N GILs, N cores.
+
+It's not a free lunch either; the whole point of an honest survey is that nothing here is.
+The catch with sub-interpreters is the same C-extension compatibility wall that free-threading
+hit — objects aren't shared across interpreters, and older compiled extensions with
+process-global state don't play along. But the trade is a different shape from the other
+three, and for server-style workloads — HTTP handlers, task workers, pipeline stages — it's
+frequently the one that lines up best.
+
+The next post is about making that bet concrete: not removing the GIL, but *multiplying* it.

@@ -1,0 +1,182 @@
+---
+title: "Watching a GIL that's never contended"
+description: "A probe-based GIL watchdog and an RSS reader behind one metrics endpoint — and the measurement that proves sub-interpreter mode drives main-GIL contention to a literal zero."
+date: 2026-07-07
+tags: [python, rust, gil, sub-interpreters, benchmarks, memory]
+series: "pyre"
+seriesOrder: 15
+draft: false
+---
+
+The entire premise of running Python across N sub-interpreters is that each one holds
+its own GIL, so the workers never queue behind a single global lock. That is a nice
+story. The problem with nice stories about lock contention is that they are invisible
+— you cannot see a lock that isn't being fought over. So we built two probes to make
+the invisible measurable, wired them to one HTTP endpoint, and pointed them at the
+server under load. The result was more absolute than expected.
+
+## Measuring a lock without hooking it
+
+The tempting way to measure GIL contention is to hook CPython's internal
+`PyThread_type_lock` and time every acquire. It is also the wrong way: those internals
+are dangerous to touch and change shape across Python versions. Instrument them and you
+own a fragile patch that breaks on the next minor release.
+
+The watchdog takes the opposite approach — it measures from the outside, the way you'd
+time a queue by standing in it. A dedicated Rust thread wakes up every 10ms, tries to
+acquire the **main interpreter's** GIL, does nothing, and releases it immediately. The
+time that acquire took *is* the contention signal:
+
+```rust
+fn spawn_gil_watchdog() {
+    std::thread::Builder::new()
+        .name("pyronova-gil-watchdog".to_string())
+        .spawn(|| loop {
+            let start = Instant::now();
+
+            Python::with_gil(|_py| {
+                // got it — do nothing, release instantly
+            });
+
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            GIL_LATENCY_US.store(elapsed_us, Ordering::Relaxed);
+            GIL_MAX_LATENCY_US.fetch_max(elapsed_us, Ordering::Relaxed);
+            GIL_PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+            if elapsed_us > 50_000 {
+                eprintln!("⚠️ [GIL MONITOR] Main GIL congested: {}ms", elapsed_us / 1000);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }).unwrap();
+}
+```
+
+If the main GIL is busy — a handler holding it while it runs Python, a numpy call that
+never releases it — the probe waits, and `elapsed_us` climbs in direct proportion to
+how long the lock is held. If nobody holds it, the probe walks straight in. All state
+is a handful of `AtomicU64` counters, so reading them is free.
+
+The memory probe is even simpler and deliberately does not trust Python's own
+`sys.getsizeof()`, which misses allocator overhead and shared pages. It reads the
+operating system's resident set size directly — `/proc/self/statm` on Linux,
+`task_info` via mach on macOS — so the number is the real RSS the OS sees, not
+Python's estimate of itself.
+
+Both feed one built-in route, `GET /__pyronova__/metrics`, matched before the user
+router so it works even if your app defines nothing:
+
+```json
+{
+  "system": { "memory_rss_mb": 67.2, "uptime_secs": 3600, "cpu_count": 10 },
+  "main_interpreter": {
+    "gil_probe_latency_us": 12,
+    "gil_max_latency_us": 45,
+    "status": "healthy"
+  },
+  "sub_interpreters": { "worker_count": 10, "total_requests": 21500000, "queue_backlog": 0 }
+}
+```
+
+It emits a Prometheus format too, so it drops into an existing Grafana board without a
+sidecar exporter.
+
+## The number that isn't a rounding error
+
+Here is what the watchdog reported under a real `wrk` load, sub-interpreter mode, ten
+workers, alongside RSS from the same run:
+
+| Scenario | Throughput | RSS | GIL peak |
+|----------|-----------:|----:|---------:|
+| Hello World | 217,134 | 61.9 MB | **0us** |
+| JSON small | 216,643 | 66.7 MB | **0us** |
+| fib(10) | 205,361 | 125.3 MB | **0us** |
+| sum(10k) | 75,138 | 62.5 MB | **0us** |
+
+Not "single-digit microseconds." Not "low." **Zero** — the peak, not just the average,
+across every scenario including CPU-bound recursion.
+
+The first instinct is that the probe is broken. It isn't, and the reason it reads zero
+is exactly the reason the architecture works. The watchdog contends for the *main*
+interpreter's GIL. But in sub-interpreter mode, no request ever runs on the main
+interpreter — every worker executes inside its own sub-interpreter holding its own,
+separate GIL:
+
+```
++--------------------------------------------------+
+| Main interpreter GIL: idle (no one using it)     |
+|   -> Watchdog probe acquires it instantly        |
+|      -> latency = 0us                            |
++--------------------------------------------------+
+| Sub-interpreter GIL-0: Worker 0 exclusive        |
+| Sub-interpreter GIL-1: Worker 1 exclusive        |
+| ...                                              |
+| Sub-interpreter GIL-9: Worker 9 exclusive        |
++--------------------------------------------------+
+```
+
+The workers are pounding their own locks in parallel; the main GIL sits idle, so the
+probe never waits. The zero is not the absence of a measurement — it is the
+measurement. Per-interpreter GILs mean there is no shared lock left to contend for,
+and that is the physical foundation under the 217k req/s number.
+
+To make the contrast concrete, the same probe run against **GIL mode** — every request
+funneled through one shared main GIL — reads exactly what you'd expect a contended lock
+to read:
+
+```
+GIL mode (single shared GIL):
+  Idle:          avg = 16us,  peak = 190us
+  Light load:    avg = 1.9ms, peak = 22ms
+  Heavy compute: avg = 1.9ms, peak = 7.8ms
+```
+
+Same probe, same code, two architectures. One reports milliseconds of queueing under
+load; the other reports zero. The instrument works; the lock just isn't there.
+
+> **Pyronova is open source.** If a main GIL that measures a literal zero under load
+> is the kind of thing you'd want to watch for yourself, ⭐ it on GitHub at
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`
+> and hit `/__pyronova__/metrics`.
+
+## The memory side of the same coin
+
+The RSS reader tells a second story. One Pyronova process idles at 36.6 MB and works
+at 62–67 MB. Compare that against a multi-process Python server delivering the same
+kind of workload — measured, not estimated, by counting the actual processes it spawns
+(22 of them):
+
+| Framework | Processes | Idle RSS | Under-load RSS |
+|-----------|----------:|---------:|---------------:|
+| Pyronova (sub-interp) | 1 | 36.6 MB | 67 MB |
+| Multi-process (22 procs) | 22 | 424.6 MB | 447.0 MB |
+
+That is **11.6× less idle memory** and **6.7× less under load**, while pushing **2.7×**
+the throughput (217k vs 81k). Normalize it — requests per second per megabyte of RSS —
+and the gap is **21.5×**. Sub-interpreters share one set of read-only pages for the
+interpreter core; twenty-two processes each pay for their own copy. One process, one
+address space, N GILs is simply cheaper than N processes.
+
+## Does watching it cost anything?
+
+A monitoring system that slows the thing it monitors is a tax, so we measured the
+watchdog against a run without it:
+
+| Scenario | No watchdog | With watchdog | Change |
+|----------|------------:|--------------:|-------:|
+| Hello World | 213,887 | 217,134 | +1.5% |
+| JSON small | 209,414 | 216,643 | +3.5% |
+| fib(10) | 206,179 | 205,361 | −0.4% |
+| sum(10k) | 73,805 | 75,138 | +1.8% |
+
+Within noise — the deltas swing both directions. And the reason is the same physics as
+the zero: the probe touches the idle main GIL every 10ms, which has no overlap with the
+workers' independent GILs. It cannot get in their way because it is standing in a
+different queue.
+
+One honest limitation: this watchdog watches the *main* GIL, which is why it reads zero.
+It does not yet see blocking *inside* a sub-interpreter — a handler that calls a
+blocking `requests.get()` instead of an async client would stall its own worker's event
+loop, and that needs per-worker instrumentation (a heartbeat coroutine measuring loop
+lag) to catch. That is the next probe to build. But the headline claim — that
+sub-interpreter mode eliminates contention on the global lock — is not a projection or
+a hand-wave. It is a measured, repeatable, literal zero.

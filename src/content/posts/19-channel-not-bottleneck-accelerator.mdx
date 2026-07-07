@@ -1,0 +1,151 @@
+---
+title: "Is the channel the bottleneck? No — it's the accelerator"
+description: "We measured the crossbeam + oneshot cross-thread dispatch layer against a direct-call baseline. The channel round-trip is 2.3–3.4× faster, not slower."
+date: 2026-07-07
+tags: [rust, performance, benchmarks, gil, architecture, sub-interpreters]
+series: "pyre"
+seriesOrder: 19
+draft: false
+---
+
+Pyronova dispatches every sub-interpreter request across a thread boundary.
+The Tokio task that owns the socket doesn't run your Python handler — it hands
+the request to a channel, an OS worker thread picks it up, runs Python, and
+sends the response back through a `oneshot`. The full round-trip looks like this:
+
+```
+Tokio task
+  → crossbeam::bounded.try_send(WorkRequest)
+    → OS worker thread recv()
+      → Python handler execution
+    → oneshot::Sender.send(Response)
+  → Tokio task wakeup
+```
+
+Every time you draw that diagram for someone, they ask the same question:
+*isn't all that cross-thread hand-off the bottleneck?* Two queues, a thread
+wakeup, a channel allocation, per request. At high concurrency, surely the
+contention on those queues is what's holding you back. Shouldn't you replace
+crossbeam with a lock-free ring buffer, or pass arena pointers instead of
+`oneshot`?
+
+It's a reasonable hypothesis. So we measured it.
+
+## The experiment
+
+The clean way to isolate dispatch cost is to compare two paths that differ
+*only* in whether they cross the channel. Pyronova already has that built in:
+
+| Mode | Path | Channel overhead |
+|------|------|------------------|
+| **GIL mode** | Tokio task → `Python::attach()` → handler → direct return | None |
+| **Sub-interp** | Tokio task → `crossbeam.try_send()` → worker `recv()` → handler → `oneshot.send()` → Tokio wakeup | Full round-trip |
+
+GIL mode calls Python directly on the Tokio thread — no channel at all.
+Sub-interp mode pays the whole round-trip. Run the same trivial handler through
+both and the difference *is* the dispatch cost.
+
+To keep the measurement about dispatch and not about handler work, the handler
+is as close to nothing as possible: `return "ok"`, minimal plaintext. Anything
+heavier and you'd be timing Python, not the channel.
+
+Environment: Apple M4 (10 cores), macOS Darwin 25.4.0, Python 3.14.3
+(per-interpreter GIL), Pyronova v1.3.0, crossbeam-channel 0.5 (bounded, capacity
+= workers × 128), `tokio::sync::oneshot` for responses, wrk 4.2.0.
+
+## The result
+
+If the channel were a bottleneck, the path *with* the channel would be slower.
+It's the opposite — at every concurrency level:
+
+| Concurrency | GIL (direct call) | Sub-interp (full channel) | Factor |
+|-------------|-------------------|---------------------------|--------|
+| c64 (2t) | 81,479 | **185,548** | **2.3×** |
+| c256 (4t) | 71,340 | **193,179** | **2.7×** |
+| c512 (4t) | 53,262 | **183,238** | **3.4×** |
+
+And latency, same story:
+
+| Concurrency | GIL | Sub-interp | Reduction |
+|-------------|-----|-----------|-----------|
+| c64 | 1.00 ms | **337 µs** | −66% |
+| c256 | 4.63 ms | **1.14 ms** | −75% |
+| c512 | 12.32 ms | **2.34 ms** | −81% |
+
+The path with *more* machinery — two queues, a thread wakeup, a per-request
+oneshot allocation — is 2.3–3.4× **faster** than the one that calls Python
+directly. The channel isn't the tax. It's the thing paying for itself many
+times over.
+
+## Why the "obvious" bottleneck isn't one
+
+The reason the intuition fails is that it's counting the wrong cost. Yes, the
+channel adds cross-thread overhead. But what it *buys* is the removal of GIL
+contention — and that's a far bigger number.
+
+In GIL mode, every request calls `Python::attach()` on a shared interpreter.
+There is exactly one GIL, so requests serialize on it. Add concurrency and they
+pile up behind the lock: throughput *falls* from 81k at c64 to 53k at c512 (−35%)
+as contention worsens. In sub-interp mode, each worker thread owns its own
+interpreter with its own GIL (PEP 684), so N handlers genuinely run in parallel.
+The channel exists solely to route a request to a free interpreter — and once it
+gets there, there's no lock to fight over.
+
+Look at how the two modes scale, and the whole architecture is in one picture:
+
+| Concurrency | GIL | Sub-interp |
+|-------------|-----|-----------|
+| c64 → c512 | 81k → 53k (−35%) | 186k → 183k (−1.6%) |
+
+Sub-interp throughput is essentially flat from c64 to c512 — down just 1.6%.
+That flatness is the proof that the channel *isn't* contending: crossbeam's
+bounded queue with `try_send` provides backpressure without lock contention, so
+piling on connections doesn't degrade it. GIL mode, meanwhile, degrades exactly
+as a lock-serialized system should. **The bottleneck was never the channel — it
+was the GIL, and the channel is what routes around it.**
+
+> **Pyronova is open source.** If a cross-thread channel that runs 2.3–3.4× faster
+> than calling Python directly is worth a look, ⭐
+> [leocaolab/pyronova](https://github.com/leocaolab/pyronova) on GitHub — or
+> `pip install pyronova` and race the two modes.
+
+## But could the channel still be faster?
+
+Fine — the channel is an accelerator, not a bottleneck. But it still has *some*
+cost. Is it worth replacing crossbeam with a hand-rolled lock-free ring buffer,
+or swapping `oneshot` for arena pointer passing? We costed those out too, and
+the numbers say no by a wide margin:
+
+| Optimization | Theoretical gain | Practical value at 186k QPS | Verdict |
+|--------------|------------------|-----------------------------|---------|
+| Lock-free ring buffer vs crossbeam | ~10 ns/op | ~2 ms/s total saved | Not worth it |
+| Arena pointers vs oneshot | ~100 ns/op | < 2% of total, adds `unsafe` | Not worth it |
+| Batch dispatch (bulk consume) | Fewer wakeups | crossbeam already avoids futex under load | Not worth it |
+| Reduce PyObject creation in handler | Cuts handler time | The actual ceiling | **Worth it** |
+
+The details back this up. crossbeam-channel 0.5 is already lock-free — it's
+built on Dmitry Vyukov's MPMC algorithm and takes a hot path with no futex under
+load. Replacing it would save single-digit nanoseconds against a handler that
+runs in microseconds. Creating a `oneshot` costs ~100 ns; at 186k QPS that's
+~18 ms/s total, under 2% of CPU. And the payload is already near-zero-copy: the
+request body is a refcounted `Bytes` straight from Hyper, headers are passed as
+the raw header map and only converted to a dict if Python actually reads
+`req.headers`.
+
+So the dispatch layer is within nanoseconds of optimal, and every proposed
+"improvement" trades real complexity and `unsafe` for savings that round to
+noise. The one line item marked *worth it* points somewhere else entirely:
+reducing PyObject creation inside the handler call path. That's the real
+ceiling.
+
+## The takeaway
+
+The lesson generalizes past this one channel. When you add cross-thread
+machinery to a system, the instinct is to suspect the machinery — it's new, it's
+visible, it's easy to point at. But the honest way to find a bottleneck is to
+build the version *without* the machinery and race them. Here, the version
+without the channel was 2.3–3.4× slower, because the machinery's job was to
+dissolve a much larger cost you couldn't see in the diagram: the GIL.
+
+The performance ceiling isn't the Rust dispatch layer. It's how fast Python can
+run your handler. That's where the next nanoseconds are — not in the channel.

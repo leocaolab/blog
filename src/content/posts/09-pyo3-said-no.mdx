@@ -1,0 +1,155 @@
+---
+title: "PyO3 said no: going raw against the CPython C-API"
+description: "PyO3 0.28 refuses to load inside a sub-interpreter. Rather than fork it, we dropped to raw pyo3::ffi — Py_NewInterpreterFromConfig, OWN_GIL, and a pure-Python request shim — and paid for it in raw pointers."
+date: 2026-07-07
+tags: [python, rust, pyo3, sub-interpreters, gil, architecture]
+series: "pyre"
+seriesOrder: 9
+draft: false
+---
+
+The whole premise of Pyronova is per-interpreter GILs: N CPython sub-interpreters
+in one process (PEP 684), each with its own independent GIL, so N Python handlers
+run genuinely in parallel on N cores. CPython 3.12+ gives you the primitive to
+build this — `Py_NewInterpreterFromConfig` with an `OWN_GIL` config. The skeleton
+was already built on PyO3 0.28, the standard Rust↔Python bridge. The plan was
+simple: spin up a few sub-interpreters, load our PyO3 module in each, done.
+
+PyO3 said no.
+
+## Where it breaks
+
+Create a second sub-interpreter, `import` a PyO3-based module in it, and you get
+an `ImportError`. This is not a bug — it's a deliberate guard. PyO3's
+`#[pymodule]` machinery stamps every module with the ID of the interpreter that
+first initialized it (an `AtomicI64` interpreter-ID check in `pymodule.rs`), and
+refuses to be loaded a second time under a different interpreter.
+
+The reason it refuses is sound. PyO3 keeps a lot of **global `static` state** —
+type object caches, interned strings, and other process-wide singletons. Under a
+single interpreter that's fine. Under multiple sub-interpreters sharing one
+process, those globals would be shared across interpreters that each have their
+own GIL and their own object graph. A `PyObject` created under interpreter A and
+touched under interpreter B — with a different GIL guarding it — is exactly the
+kind of cross-interpreter reference that leads to refcount corruption and
+segfaults. PyO3 blocks the whole scenario rather than let you find that out at
+3am.
+
+This is tracked upstream and has been for a long time:
+
+- [PyO3#3451](https://github.com/PyO3/pyo3/issues/3451)
+
+No ETA. So the choice was: fork PyO3, or go around it.
+
+## Why not fork PyO3
+
+Forking is the obvious move, and there's even a fairly precise version of it —
+two changes would do most of the work:
+
+1. In `pymodule.rs`, drop the `AtomicI64` interpreter-ID check in `make_module`.
+2. Migrate `#[pymodule]`'s global `static` state to `PyModule_GetState`, so each
+   interpreter gets its own isolated copy instead of sharing one.
+
+That's genuinely the right long-term fix, and it's the kind of thing worth
+revisiting once the model is proven. But as the *first* step it's a bad trade. You'd be maintaining a fork
+of a large, fast-moving library, carrying that patch across every PyO3 release,
+and betting the core of the project on internal PyO3 details staying stable — all
+before you've even proven the sub-interpreter model works at all. The thing we
+actually needed to de-risk was "can N interpreters serve HTTP in parallel," not
+"can we re-plumb PyO3's module state."
+
+So we went around it.
+
+## Raw FFI: talk to CPython directly
+
+PyO3 ships `pyo3::ffi` — thin, unsafe bindings to the raw CPython C-API. You don't
+get any of PyO3's safety, but you also don't get its global-state guardrails,
+because there's nothing between you and the interpreter. For the sub-interpreter
+path, that's exactly what we want.
+
+The skeleton runs each worker thread against its own sub-interpreter, created with
+its own GIL:
+
+```rust
+let config = ffi::PyInterpreterConfig {
+    check_multi_interp_extensions: 0,   // lenient: allow undeclared C extensions
+    gil: ffi::PyInterpreterConfig_OWN_GIL,
+    // ...
+};
+```
+
+`OWN_GIL` is the whole point: each sub-interpreter gets its own independent GIL,
+so a handler running in interpreter 3 doesn't block a handler in interpreter 7.
+From there the request path is raw C-API calls:
+
+- `Py_NewInterpreterFromConfig` — create the sub-interpreter with the config above
+- `PyRun_String` — execute the user's script inside it (framework code filtered out)
+- `PyDict_GetItemString` — pull the handler function out of the module globals
+- `PyObject_Call` — invoke the handler directly
+
+No PyO3 module, no interpreter-ID stamp, no shared static caches. Each interpreter
+is its own island.
+
+> **Pyronova is open source.** If going raw against the CPython C-API sounds like fun, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+
+## The `_Request` shim
+
+There's one casualty. In GIL mode, a request is a PyO3 `#[pyclass]` — a proper
+Rust struct exposed to Python. But `#[pyclass]` types are built by exactly the
+PyO3 machinery that won't load in a sub-interpreter. So inside sub-interpreters
+the handler can't be handed a PyO3 object.
+
+The fix is deliberately boring: a **pure-Python** `_Request` (and `_Response`)
+shim. Instead of exposing a Rust class, the raw-FFI path constructs plain Python
+objects that present the same interface — `.params`, `.headers`, `.query_params`,
+and so on. It's a maintenance cost (two request types that must behave
+identically), but it sidesteps `#[pyclass]` entirely and keeps handler code
+unchanged whether it runs under one GIL or ten.
+
+## What "lenient mode" actually buys — and costs
+
+Notice `check_multi_interp_extensions: 0` in the config. CPython 3.12+ added a
+flag that, when set to `1` (strict mode), makes `import` reject any C extension
+that hasn't declared it's safe under multiple interpreters:
+
+```c
+Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
+```
+
+Most legacy C extensions have never declared this flag. Set strict mode and
+`import numpy` fails on principle. Set lenient mode (`0`) and CPython lets the
+extension load anyway — which means popular libraries mostly *work*, but you've
+also turned off the guard rail. An extension with genuinely unsafe global state
+can now segfault at runtime instead of failing cleanly at import.
+
+We tested this directly, and the full library-by-library compatibility matrix
+(orjson, numpy, and the stdlib, measured on Python 3.14.3 / macOS ARM64) lives in
+[PEP 684 and friends](/blog/05-pep-684-and-friends-a-field-guide/). The one result
+that shapes this server: numpy simply isn't usable under sub-interpreters. Its
+`_multiarray_umath` module refuses to load more than once per process, so the
+first sub-interpreter can `import numpy` and every later one fails — you route
+numpy through a GIL-mode path or you don't run it at all.
+
+For that reason, strict mode is exposed as an opt-in — `strict_extensions=True` —
+so you can trade the compatibility for the safety guarantee when you want it.
+
+## The bill for going raw
+
+Bypassing PyO3 means bypassing everything PyO3 does for you. The first
+sub-interpreter proof-of-concept was a field of hazards:
+
+- bare `*mut ffi::PyObject` pointers with no lifetime tracking
+- manual `Py_INCREF` / `Py_DECREF` — one miscount is a leak or a use-after-free
+- no RAII, no `Drop`, no safety net
+- script filtering done by naive string matching
+- no `Py_EndInterpreter` cleanup when a worker exits
+
+Every one of those is a footgun PyO3 would normally hold for you. Hardening them —
+an RAII wrapper (`PyObjRef`) that DECREFs on `Drop`, AST-based script filtering
+instead of string matching, proper `Py_EndInterpreter` teardown — became its own
+chunk of work, and later its own war stories.
+
+But it worked. Ten sub-interpreters, ten independent GILs, ten handlers running in
+parallel in one process — the thing PyO3 wouldn't let us build, built directly on
+the C-API underneath it. Whether that actually beats the alternative — free-threaded
+Python, which removes the GIL entirely — is a fair question. We benchmarked it.
