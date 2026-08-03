@@ -1,6 +1,6 @@
 ---
-title: "Free-threaded Python is real now. We took the other road and changed nothing."
-description: "Free-threading has crossed a threshold — PyO3 supports it, FastAPI runs on it, and CPU-bound work genuinely scales. But the interesting bill isn't the runtime; it's migrating the ecosystem, in a language that lacks the concurrency tools that made this survivable elsewhere. So we ran the opposite experiment: multiply the GIL, and don't modify a single library."
+title: "Updates on sub-interpreter C-extension support"
+description: "What breaks when you push the unmodified Python C-extension ecosystem — numpy, scipy, scikit-learn, orjson — into own-GIL sub-interpreters: what works, what doesn't, what we fixed, and the one constraint that decides whether it fits your workload."
 date: 2026-08-03
 tags: [python, free-threading, sub-interpreters, c-extensions, gil, concurrency]
 series: "pyre"
