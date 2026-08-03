@@ -1,0 +1,252 @@
+---
+title: "Free-threaded Python is real now. We took the other road and changed nothing."
+description: "Free-threading has crossed a threshold — PyO3 supports it, FastAPI runs on it, and CPU-bound work genuinely scales. But the interesting bill isn't the runtime; it's migrating the ecosystem, in a language that lacks the concurrency tools that made this survivable elsewhere. So we ran the opposite experiment: multiply the GIL, and don't modify a single library."
+date: 2026-08-03
+tags: [python, free-threading, sub-interpreters, c-extensions, gil, concurrency]
+series: "pyre"
+seriesOrder: 42
+draft: false
+---
+
+Free-threading is no longer a demo. As of the last few releases the pieces are
+actually landing: [PyO3](https://pyo3.rs/) — the standard Rust↔Python bridge —
+ships free-threaded support, so Rust extensions can opt in; web stacks built on
+Starlette/uvicorn run on the `python3.13t` build; and for genuinely CPU-bound
+endpoints the multi-core numbers are real, not theoretical. [PEP 703](https://peps.python.org/pep-0703/)
+(`--disable-gil`, Final) is doing what it said it would. Credit where it's due —
+"just remove the GIL" turned out to be buildable.
+
+So this isn't a "free-threading is bad" post. It's a post about the part that
+*isn't* the runtime.
+
+## The runtime was the easy 10%
+
+Removing the GIL is a heroic engineering effort, but it's the part with a finite,
+solvable scope: a fixed codebase, a core team, a shipping build. The 90% is
+everything downstream — getting the ecosystem to be *correct* without a global
+lock — and that part has no owner and no deadline.
+
+Here's the shape of it. The GIL wasn't only a speed ceiling; it was a giant,
+accidental safety net. Under it, `d[k] = v` and `lst.append(x)` are effectively
+atomic at the bytecode level, so twenty years of ordinary threaded Python has been
+*mostly* correct without anyone reaching for a lock. Take the GIL away and that
+guarantee is gone. `if k not in cache: cache[k] = compute()` from two threads now
+races. Every module-level cache, every in-memory counter, every framework global
+becomes a bug you have to find and lock.
+
+And Python hands its developers that problem without the tools the other
+multi-core languages spent decades building:
+
+- **No concurrent collections in the stdlib.** Java has `ConcurrentHashMap`; C++
+  has TBB; Go has `sync.Map`. Python's `dict`/`list` aren't thread-safe under
+  free-threading, and there's no batteries-included concurrent map to reach for.
+- **No RAII / scoped locking.** C++ has `std::lock_guard`, so you can't forget to
+  unlock. Python's `with lock:` is close, but it's a convention layered on code
+  that was never written to need it.
+- **No static net — and by construction, it can't have one.** Rust rejects a data
+  race at *compile time*, but that guarantee is bought with static types and an
+  ownership system. You can't retrofit that onto a dynamically-typed language whose
+  state is all mutable `dict`s and duck typing — there's no static ownership to
+  analyze. That door is closed to Python by its nature, not by omission. The
+  runtime alternative — a ThreadSanitizer-style dynamic race detector — *could*
+  exist but doesn't for Python-level races. So there's nothing above your code to
+  catch the mistake; the failure mode is a silent wrong answer at 3am under load,
+  the hardest bug class there is.
+
+None of that is fatal to free-threading. It just means the *migration* is the real
+project, and it's the kind of project that took the Python 2→3 transition twelve
+years — and that was a mechanical, `UnicodeDecodeError`-loud change, not a
+distributed hunt for un-synchronized shared state. Add the ~5–6% single-threaded
+overhead PEP 703 measures ("One thread: 6% / 5%"), and for a lot of teams the
+honest near-term answer is "wait."
+
+## So we asked the opposite question
+
+Our engine (this is a build log — see the [rest of the series](/blog/03-the-bet-multiply-the-gil/))
+takes the other fork: instead of removing the GIL, **multiply** it. Thread-per-core,
+one own-GIL CPython sub-interpreter pinned to each core ([PEP 684](https://peps.python.org/pep-0684/),
+per-interpreter GIL, Final in 3.12), shared-nothing between them. The question we
+actually wanted answered: run a real multi-core HTTP server and **change nothing in
+any Python library** — what breaks, and *which parts* exactly?
+
+We treated it as an expedition. Push the unmodified ecosystem — pure Python,
+single-phase C extensions, native BLAS pools, Rust modules — into own-GIL workers,
+walk into every wall, and figure out for each one whether it's a hard cliff, a
+detour, or a thing you just don't do. The point wasn't only to make our own server
+work; it was to come back with a **map**, so the next person who tries this reads
+the terrain instead of re-discovering each drop-off at 3am. What follows is that
+map: where it's flat, where the walls are, and the one ridge that decides whether
+you should be hiking here at all.
+
+### Your Python code: safe by construction
+
+This is the part that falls out for free, and it's the whole reason the model is
+worth the trouble. Because each core is its own interpreter with its own
+`sys.modules` and its own namespace, **there is no shared mutable state between
+workers**. The `cache[k] = v` race from the free-threading section can't happen —
+worker A and worker B don't share a `cache`; they have their own. The missing
+`ConcurrentHashMap`, the absent RAII, the lack of a race detector — none of it
+applies, because there's nothing to race on. You get multi-core, and your
+unmodified, GIL-assuming Python stays correct. The tradeoff is real (each worker
+is its own world, so cross-worker state has to go somewhere explicit — the
+[Rust-side shared store](/blog/14-sharedstate-cross-worker-memory-without-redis/),
+not a Python global), but *correctness* is not the thing you pay.
+
+### C-extensions: the actual hard part
+
+Pure Python was the easy half. The single-phase C extensions — numpy, scipy,
+pandas, scikit-learn, orjson — are where the work is, because they hold
+process-global state and refuse to load into a second interpreter
+(`cannot load module more than once per process`). Our answer, which the series
+covers in depth: give each worker its own copy-on-write **physical copy** of the
+extension (so each loads a distinct `.so` with independent global state), and flip
+CPython's per-interpreter compatibility switch *only* around each load. As of the
+latest release you don't even declare which libraries — the first `import numpy`
+in a worker is handled for you, including built-in extensions your dependencies
+pull in transitively (scikit-learn drags in `faulthandler` through joblib).
+
+The honest taxonomy, because "it all works now" would be a lie:
+
+| Extension | In an own-GIL sub-interpreter | How |
+|---|---|---|
+| stdlib / multi-phase (PEP 489) | ✅ works out of the box | already isolation-ready |
+| numpy, scipy, pandas, scikit-learn, orjson, pydantic_core, tokenizers | ✅ works, unmodified | per-worker copy + load-time override |
+| built-ins that can't be copied (e.g. `faulthandler`) | ✅ works | load shared under the same override |
+| `lxml` | ❌ refuses | libxml2 ships its own "interpreter changed" self-check |
+
+Not a binary "the ecosystem works" — a per-library reality. But the **main
+scientific/ML stack works, unmodified**, verified by a 16-worker soak that hammers
+a broad API surface (SVD, BLAS matmul, FFT, LAPACK solves, scikit-learn
+fit/predict, orjson) on macOS *and* Linux — the Linux run did 1.01M requests with
+zero errors.
+
+## The one thing that decides if this fits you: where parallelism comes from
+
+This is the part that matters most, so it gets said plainly rather than buried in
+a caveat.
+
+The scientific libraries don't just hold global state — many of them run their own
+native **thread pool**. numpy's `np.linalg.inv` doesn't compute on the calling
+thread; it hands off to OpenBLAS, which fans the work across a pool of ~35 threads.
+That pool is the problem. Driven concurrently from many own-GIL workers, its
+internal state corrupts and the process segfaults in `dgetrf_parallel`. And
+**isolation does not save you here** — we gave each worker its own patched-SONAME
+copy of OpenBLAS, confirmed a distinct instance per worker, and it *still* crashed.
+The library's threaded mode is fundamentally incompatible with being driven from
+these worker threads. A physical copy fixes *loading*; it does nothing for a
+*runtime thread pool*.
+
+So we don't fix OpenBLAS's concurrency. We **switch it off** —
+`OPENBLAS_NUM_THREADS=1`, and the OpenMP / MKL / rayon equivalents. Every native
+call runs single-threaded. And that one setting quietly relocates where all your
+parallelism comes from:
+
+- **Before:** one big `np.linalg.inv` spreads *itself* across every core —
+  parallelism **inside a single operation**.
+- **After:** that call is pinned to one core. Parallelism now comes only from
+  running **many workers, each doing independent work** — parallelism **across
+  requests**.
+
+That is the entire decision, and it cuts cleanly:
+
+- If your load is **many independent, CPU-heavy tasks** — a web server, a
+  partition-parallel data pipeline — this is exactly right. Every core stays busy
+  on a different request, and you've dodged the N-workers × M-BLAS-threads
+  oversubscription that would otherwise thrash the machine. This is the workload
+  we build for.
+- If your load is **one enormous computation that wants the whole machine** — a
+  single huge linear solve, one giant matmul — this architecture is the *wrong
+  tool*. Pinned to one core per worker, it will be slow. That work belongs on the
+  main interpreter (or the Rust engine layer) with multi-threaded BLAS, not
+  fanned out to sub-interpreters.
+
+The honest one-liner: sub-interpreter isolation buys you the whole unmodified
+ecosystem, but it moves parallelism from *inside the operation* to *across the
+workers* — and no amount of cleverness moves it back. If your problem is shaped
+like "many small independent jobs," that's a gift. If it's shaped like "one
+colossal job," it's a mismatch you should route elsewhere.
+
+## The honest costs
+
+None of this is free, and it would be dishonest to end on a victory lap. Three
+bills, stated plainly.
+
+**1. Memory.** This is the big one and it's structural. A per-worker *copy* of
+numpy is a per-worker copy in RAM once it's loaded and mapped. Sixteen workers
+means sixteen numpy instances — on the order of a couple hundred MB per worker for
+a full numpy+scipy+sklearn set. Copy-on-write keeps *disk* nearly free, but
+resident memory scales with worker count, and it scales with the size of the
+libraries you isolate. It's the exact mirror of free-threading's trade:
+free-threading shares one copy and pays an atomic tax per object touch;
+sub-interpreters pay in memory to avoid ever sharing.
+
+**2. Longer loading.** Isolation moves work to startup. Each worker clones its
+libraries and imports them itself, so the import cost is paid N times, not once —
+and on macOS the kernel verifies each freshly-cloned `.dylib`'s code signature on
+first `dlopen`, which for a numpy+scipy+sklearn set is hundreds of libraries and
+*seconds* per worker on a cold boot (a 16-worker cold start can take minutes to
+first request). A warm restart reuses the already-verified copies and starts in
+seconds, so this is a first-boot cost, not a per-request one — but if you
+autoscale by spawning fresh processes, you feel it every time.
+
+**3. What we can't solve.** Being honest, some of this has no engine-side fix:
+
+- **Some libraries simply refuse.** `lxml` ships its own "interpreter changed"
+  check inside libxml2; a physical copy doesn't defeat a guard the library
+  enforces itself. Nothing we do downstream fixes that — it needs upstream.
+- **torch doesn't fit at all.** A multi-GB extension with a process-global CUDA
+  context can't be cloned per worker, and torch doesn't support sub-interpreters.
+  Deep-learning inference/training in a worker is out; that path stays on the main
+  interpreter or a separate process. This is a hard wall, not a rough edge.
+- **Libraries that spawn persistent background threads are a hazard.** If a lib
+  starts daemon threads at import (some APM agents, some pools), finalizing that
+  interpreter can deadlock. We made graceful shutdown *avoid* the abort by exiting
+  before finalization — but that sidesteps the problem, it doesn't make
+  thread-spawning libraries safe to tear down. The model wants stateless,
+  stop-and-go compute, and punishes libraries that don't play that way.
+- **Shared *mutable* state has to leave Python.** You cannot hand a live Python
+  object across the worker boundary; cross-worker state goes to an explicit store
+  (the Rust-side shared map, or Redis) and data crosses as bytes. If your workload
+  is heavy on shared mutable state, this is friction — and it's exactly the case
+  where free-threading's shared heap wins outright.
+- **On Linux, one more prerequisite:** `PYTHONMALLOC=malloc` for an import-time
+  cross-arena free (~5–6% when on) — an engine default we're wiring in. (The bigger
+  native-threading constraint gets its own section below; it's the one that decides
+  whether this architecture fits your workload at all.)
+
+## Where that leaves it — and the actual vision
+
+Both roads get you multiple cores; they differ in where they put the cost.
+Free-threading puts it on your code and on a multi-year ecosystem migration, in a
+language without the tools to pay it cheaply. Sub-interpreters put it on memory and
+startup and the handful of libraries that don't fit — but the code stays unmodified
+and correct, and the ecosystem comes along today.
+
+But step back from this one release, because our view of *parallel Python* is
+bigger than "it runs on many cores now." We don't actually think Python should
+become a language you write complex multithreaded code in. Python is at its best as
+a **simple glue language** — expressive, forgiving, single-threaded in spirit. The
+hard concurrency — the thread pools, the shared mutable state, the lock discipline —
+belongs in the runtime *beneath* it, in C and Rust, where the type systems and
+ownership models to do it safely actually exist. Free-threading pushes the hard part
+*up*, into the glue and into a hundred thousand libraries that were never built for
+it. We'd rather push it *down*: let the engine own the concurrency, the shared
+state, and the data plane, and let each Python worker stay small, isolated, and
+correct-by-construction — no locks, nothing shared, nothing to race on.
+
+For the workloads we care about — **web servers and data-processing workers**, many
+independent jobs over the existing ecosystem — that's not just the thing that works
+today. Long-term, we think isolated sub-interpreters are the *right* design: keep
+Python simple, keep the multithreading in the runtime, and get real multi-core
+without asking the language to become something it isn't.
+
+This release is one waypoint on that map, not the destination. There's more terrain
+to chart — the allocator and thread-pool defaults still to fold into the engine, the
+libraries that still refuse, the best-practice patterns for shared state — and we'll
+keep walking it and writing down what we find.
+
+**Full results** — the per-library findings, the failure classes, the mac-vs-Linux
+differences, and the measured numbers — are in the repo:
+[docs/subinterp-c-extension-status](https://github.com/leocaolab/pyronova/blob/main/docs/subinterp-c-extension-status.en.md).
+
+> Pyronova is open source, if you'd rather multiply the GIL than delete it — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) (`pip install -U pyronova`). Counter-arguments welcome; this is a bet, not a verdict.
