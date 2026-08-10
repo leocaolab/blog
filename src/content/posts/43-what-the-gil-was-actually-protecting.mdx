@@ -1,0 +1,520 @@
+---
+title: "What the GIL was actually protecting"
+description: "We claimed free-threading breaks ordinary Python, then measured it on one binary with one env var flipped — and got two of our three claims wrong. What the GIL really guaranteed, why dict survives but your logic doesn't, why adding locks lands you slower than the GIL build, and the one workload where free-threading wins outright: 17 GB against 3 MB."
+date: 2026-08-10
+tags: [python, free-threading, gil, concurrency, benchmarks, sub-interpreters]
+series: "pyre"
+seriesOrder: 43
+draft: false
+---
+
+The [last post](/blog/42-updates-on-subinterpreter-c-extension-support/) argued that
+removing the GIL was the easy 10% and that fixing the ecosystem is the other 90%. That
+section made three claims about what actually breaks, and — this is the embarrassing
+part — it made them from memory, not from a measurement.
+
+So we measured them. Two of the three were wrong. The corrected version is a stronger
+argument than the one we published, which is the usual outcome when you stop reasoning
+about a runtime and go run it.
+
+Everything below is on CPython 3.14.5 free-threaded, Apple M5 Pro (18 cores),
+macOS 26.5, 8 threads.
+
+## The control group is one env var
+
+You don't need two Python installs, and you shouldn't use two — a homebrew GIL build
+and a uv free-threaded build differ in patch version *and* compiler, and someone will
+tell you that's what you measured.
+
+The free-threaded build can put the GIL back:
+
+```bash
+uv python install 3.14t
+
+python3.14t probe.py                 # GIL off
+PYTHON_GIL=1 python3.14t probe.py    # same binary, GIL on
+```
+
+One process image, one compiler, one libc. The only variable is the GIL. Every number
+in this post is that pair.
+
+Here's the probe. Four shapes of ordinary Python, no locks anywhere:
+
+```python
+import sys, threading
+
+N, ITERS = 8, 200_000
+
+def race(work, setup, check):
+    state, bar = setup(), threading.Barrier(N)
+    ts = [threading.Thread(target=lambda: (bar.wait(), work(state))) for _ in range(N)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    return check(state)
+
+# 1. one builtin op
+def append(lst):
+    for i in range(ITERS): lst.append(i)
+
+# 2. read-modify-write, no call inside
+class Box: n = 0
+def incr(b):
+    for _ in range(ITERS): b.n += 1
+
+# 3. check-then-act — there IS a call in the middle
+def cached(pair):
+    cache, hits = pair
+    mine = 0
+    for k in range(2000):
+        if k not in cache:
+            cache[k] = sum(i * i for i in range(400))
+            mine += 1
+    hits.append(mine)
+
+# 4. an unsynchronized object whose invariant is money
+class Ledger:
+    def __init__(self): self.acct = [1000] * N
+    def move(self, s, d):
+        if self.acct[s] >= 1:      # check
+            self.acct[s] -= 1      # act
+            self.acct[d] += 1
+def transfer(led):
+    for i in range(ITERS): led.move(i % N, (i + 1) % N)
+
+print(f"GIL enabled: {sys._is_gil_enabled()}")
+for label, want, got in [
+    ("list.append(i)",               N * ITERS, race(append, list, len)),
+    ("obj.n += 1",                   N * ITERS, race(incr, Box, lambda b: b.n)),
+    ("if k not in cache: cache[k]=", 2000,      race(cached, lambda: ({}, []), lambda p: sum(p[1]))),
+    ("ledger total (invariant)",     N * 1000,  race(transfer, Ledger, lambda l: sum(l.acct))),
+]:
+    d = got - want
+    print(f"{label:<30} want {want:>9,}  got {got:>9,}  {'OK' if not d else f'OFF BY {d:+,}'}")
+```
+
+And the two runs, side by side:
+
+| | `PYTHON_GIL=1` | GIL off |
+|---|---|---|
+| `lst.append(i)` × 1.6M | 1,600,000 ✅ | **1,600,000 ✅** |
+| `obj.n += 1` × 1.6M | 1,600,000 ✅ | **265,014 — off by −1,334,986** |
+| `if k not in cache: cache[k] = …` (2000 keys) | 2,002 (+2) | **6,831 — off by +4,831** |
+| ledger total (must be conserved) | 8,000 ✅ | **9,802 — off by +1,802** |
+
+No exception. No warning. No crash. Just a program that returns the wrong number, and
+a ledger that invented 1,802 units of money.
+
+## Correction 1: `dict` and `list` are fine
+
+We wrote: *"Python's `dict`/`list` aren't thread-safe under free-threading."*
+
+That's simply false, and the first row shows it — 1.6 million appends from 8 threads,
+nothing lost, nothing duplicated, no torn read. The [free-threading
+docs](https://docs.python.org/3/howto/free-threading-python.html) say so directly:
+
+> "Built-in types like `dict`, `list`, and `set` use internal locks to protect against
+> concurrent modifications in ways that **behave similarly to the GIL**."
+
+Per-object locks, and [PEP 703](https://peps.python.org/pep-0703/) specifies them:
+*"All operations that modify the object must hold the object's lock."*
+
+The real gap isn't safety, it's **composition**. `ConcurrentHashMap` gives you
+`computeIfAbsent` — a compound operation that is itself atomic. Python's `dict` gives
+you atomic *steps* and no way to compose them. PEP 703 says this out loud, and this is
+the sentence we should have quoted in the first place:
+
+> per-object locking provides "weaker protections than the GIL" and **"cannot ensure
+> that concurrent operations are atomic or correct."**
+
+Individual operations survive. Your logic doesn't.
+
+## Correction 2: the safety net was denser than we said
+
+We wrote that `if k not in cache: cache[k] = compute()` *"now races"* — implying it
+didn't before. It did: 2 duplicate computes out of 2000 under the GIL, right there in
+the table. Compound operations were never atomic.
+
+But the second row is the one that broke our story. `obj.n += 1` is also a compound
+read-modify-write, and under the GIL it lost **zero** updates out of 1.6 million. So we
+turned the screw — `sys.setswitchinterval()` from the 5 ms default down to 100 ns:
+
+```
+  switchinterval     expected          got         LOST        %
+           5e-03    1,600,000    1,600,000            0   0.000%
+           1e-04    1,600,000    1,600,000            0   0.000%
+           1e-06    1,600,000    1,600,000            0   0.000%
+           1e-07    1,600,000    1,600,000            0   0.000%
+```
+
+Not rare. **Impossible.** Which means the GIL wasn't protecting this statistically — it
+was protecting it structurally, and we didn't understand how.
+
+Here is the mechanism. CPython does not consider a thread switch after every bytecode;
+it checks at specific points, and a `CALL` is one of them. Look at what `c.n += 1`
+compiles to:
+
+```
+LOAD_FAST_BORROW    0 (c)
+COPY                1
+LOAD_ATTR           0 (n)
+LOAD_SMALL_INT      1
+BINARY_OP          13 (+=)
+SWAP                2
+STORE_ATTR          0 (n)
+```
+
+Straight line. No call. Nowhere for the GIL to change hands between the load and the
+store — so the whole read-modify-write is atomic in practice.
+
+Put one Python-level call in the middle and the floor opens up. Same binary, same
+`PYTHON_GIL=1`:
+
+| body | GIL on | GIL off |
+|---|---|---|
+| `c.n += 1` | **0.000% lost** | 78.57% lost |
+| `c.n = identity(c.n) + 1` | **61.58% lost** | 81.37% lost |
+
+Identical semantics. Identical result required. The only difference is that a call
+instruction sits between the read and the write, and 61% of the updates fall through
+it. Under free-threading, both are equally broken, because there is no handoff point
+to be on the right side of.
+
+So the safety net was real, and it was **bigger** than we claimed — not just single C
+operations, but every compound operation with no call inside it. Twenty years of
+`self.count += 1` with no lock really was correct, and it was correct by accident, in a
+way CPython never promised and never documented.
+
+That's a better sentence than the one we shipped. It's also a scarier one, because a
+guarantee nobody wrote down is a guarantee nobody knows they're depending on.
+
+## So which `+= 1` actually breaks?
+
+This is the question that decides how big your migration is, so it's worth answering
+precisely rather than with "shared state." Same increment, seven kinds of binding:
+
+| | `PYTHON_GIL=1` | GIL off |
+|---|---|---|
+| **local variable** `c += 1` | 1,600,000 ✅ | **1,600,000 ✅** |
+| `global G += 1` | ✅ | 259,408 ❌ |
+| closure cell (`nonlocal c`) | ✅ | 431,991 ❌ |
+| `self.n += 1` (instance attribute) | ✅ | 396,800 ❌ |
+| `Cls.n += 1` (class attribute) | ✅ | 262,957 ❌ |
+| `d['n'] += 1` | ✅ | 267,790 ❌ |
+| `L[0] += 1` | ✅ | 332,709 ❌ |
+
+Locals are safe by construction and always will be — the name is bound to a frame, each
+thread has its own frame, there is nothing to share. Every other row is bound to
+something that outlives the frame, and every other row breaks.
+
+The test isn't "is it in a function" or "is it in a class." It is: **does this name
+outlive the stack frame that touches it?** If yes, free-threading is your problem now.
+
+That rule is also why the migration is hard to scope. It doesn't select a syntax you
+can grep for. It selects a *lifetime*, and lifetimes aren't in the source text.
+
+## You don't have to write threads to be running in them
+
+The obvious reaction to all of this is: *I don't write threaded code, so none of this
+is mine.* Mostly true — and it's the reason "wait" is a defensible position. But there
+is one place it fails, and it's the place most Python actually runs.
+
+Here is an app module. Nobody in this file typed `threading`:
+
+```python
+_hits = 0                       # a metrics counter
+_sessions = {}                  # a session cache
+
+def handle_request(user_id):    # your view function
+    global _hits
+    _hits += 1
+    if user_id not in _sessions:
+        _sessions[user_id] = {"uid": user_id}
+    return expensive_lookup(user_id % 200)
+
+# and the server. gunicorn --threads 8, waitress, or loop.run_in_executor
+with ThreadPoolExecutor(max_workers=8) as pool:
+    pool.map(handle_request, range(200_000))
+```
+
+| | `PYTHON_GIL=1` | GIL off |
+|---|---|---|
+| requests served | 200,000 | 200,000 |
+| `_hits` counter | 200,000 ✅ | **161,908 — lost 38,092 (19%)** |
+
+Two hundred thousand requests served. Zero exceptions. Zero log lines. Your dashboard
+is 19% low, forever, and nothing anywhere will tell you.
+
+(The `lru_cache` in that run was fine — 200 computes for 200 keys. The 3.5× duplication
+from the earlier section needs many threads hitting *cold* keys at once, which is a
+startup and cache-flush problem, not a steady-state one. Both are true; it depends on
+the access pattern, which is its own kind of unpleasant.)
+
+The threads came from gunicorn. And this is the tension nobody can wish away:
+**"nobody writes threads" and "free-threading is worth adopting" cannot both be true.**
+Free-threading only pays off when your code runs on many threads at once. There is no
+middle state where you get the benefit without the exposure — running 3.14t
+single-threaded just buys you the 5–10% overhead and nothing else.
+
+Worse, the exposure isn't mainly in code you wrote. Your own `_cache = {}` you can at
+least grep for. The ORM's identity map, the HTTP client's connection pool, the SDK's
+module-level singleton, the memoizing decorator three dependencies down — you will
+neither see those nor audit them. And the switch may not even be your decision: a base
+image bump, a `--threads 8` in a config file, a dependency that starts shipping only
+free-threaded wheels. Nothing sends you a notification saying *you are multi-threaded now*.
+
+## "Thread-safe" has always meant the structure, not your logic
+
+The cleanest illustration isn't in anyone's application code — it's in the standard
+library, in the decorator everybody uses.
+
+`functools.lru_cache` is documented as threadsafe. Under 8 threads asking for the same
+2000 keys:
+
+| | `compute()` calls (want 2000) |
+|---|---|
+| `PYTHON_GIL=1` | 2,001 |
+| GIL off | **7,049** |
+
+Each key computed 3.5 times on average. The cache never corrupts — 2000 entries, every
+one correct. It just stops being a cache.
+
+And this is **fully conforming behavior**. From the
+[docs](https://docs.python.org/3/library/functools.html):
+
+> "The cache is threadsafe so that the wrapped function can be used in multiple threads.
+> This means that the underlying data structure will remain coherent during concurrent
+> updates. **It is possible for the wrapped function to be called more than once** if
+> another thread makes an additional call before the initial call has been completed
+> and cached."
+
+Nothing is broken. No bug to file. The guarantee was always "the dict stays coherent,"
+never "your function runs once" — and under the GIL those two were close enough that
+nobody had to know the difference. Under free-threading, one of them holds and the
+other evaporates, and your CPU bill is the only thing that tells you.
+
+That's the 90%, in one decorator: not *unsafe*, just quietly no longer doing its job.
+
+## Then just add locks?
+
+Sure. Here's the bill. Same shared counter, four ways to make it correct:
+
+| | GIL off | `PYTHON_GIL=1` | correct? |
+|---|---|---|---|
+| naive `obj.n += 1` | 79.6 ms | 40.0 ms | ❌ off by −1,341,974 |
+| `with lock: obj.n += 1` | **201.0 ms** | 101.9 ms | ✅ |
+| `next(itertools.count())` (atomic, C-level) | **369.0 ms** | 28.4 ms | ✅ |
+| thread-local accumulate, combine at the end | **4.4 ms** | 17.8 ms | ✅ |
+
+Three things in there are worth more than the correctness result.
+
+**Adding the lock makes you slower than the GIL build.** 201 ms against 101.9 ms — you
+deleted the global lock and replaced it with your own, except yours has none of the
+tuning twenty years of CPython work put into the GIL's handoff. You paid the
+single-threaded overhead to unlock multi-core and then serialized on the same object
+anyway.
+
+**Reaching for a lock-free primitive can be worse.** `itertools.count()` is atomic and
+C-implemented and it came last at 369 ms — eight cores fighting over one cache line.
+"Use an atomic" is not a free correctness upgrade under contention.
+
+**The only strategy that actually wins is not sharing.** 4.4 ms: 45× faster than the
+locked version, and 4× faster than the same code on the GIL build. That is what
+free-threading is *for*, and it is the one row where the multi-core promise shows up.
+
+So the honest answer to "do I add locks in 3.14?" is:
+
+- On `python3.14` (the normal GIL build): **no.** Nothing changed. Your code is exactly
+  as correct as it was yesterday.
+- On `python3.14t`: **locks aren't the answer, they're the consolation prize.** The
+  answer is to stop sharing — and that is a data-flow rewrite, not a `with lock:` you
+  sprinkle on. Module-level caches, global counters, framework singletons, memoized
+  registries: each one has to become thread-local or explicitly owned.
+
+Which is the real shape of the 90%. Not "find the races and lock them." **"Find the
+shared mutable state and design it away"** — across a hundred thousand libraries that
+were written in a world where they didn't have to.
+
+## "Just make it immutable" is the one that was already broken
+
+The obvious escape hatch is to stop mutating: freeze the state, and replace it instead
+of updating it. `@dataclass(frozen=True)`, `tuple`, `frozenset` — Python has the types.
+
+It doesn't work, for a reason that has nothing to do with free-threading:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class Cfg:
+    n: int
+
+CFG = Cfg(0)                                          # the value is immutable
+def worker():
+    global CFG
+    for _ in range(ITERS):
+        CFG = dataclasses.replace(CFG, n=CFG.n + 1)   # the BINDING is not
+```
+
+| | `PYTHON_GIL=1` | GIL off |
+|---|---|---|
+| frozen dataclass, rebind a global (want 800,000) | **207,918 ❌** | **133,583 ❌** |
+| same value type, binding is thread-local | 800,000 ✅ | 800,000 ✅ |
+
+It loses three quarters of the updates **on the GIL build too** — and by now you can
+predict why: `dataclasses.replace(...)` is a call, and a call is a handoff point. The
+functional idiom `state = update(state)` is a read-modify-write like any other. Freezing
+the value does nothing, because the thing being raced on is the *name*.
+
+Two more edges, since "immutable" is doing a lot of load-bearing work in these
+discussions:
+
+- **There is no deep immutability.** `BOX = ([],)` is a tuple, and the list inside it is
+  as mutable as any other. Immutability in Python is one level deep and stops there.
+- **`frozen=True` is a convention with a `__setattr__` in front of it.**
+  `object.__setattr__(cfg, "n", 99)` walks straight through it. Nothing in the runtime
+  enforces the freeze.
+
+Which lands in the same place as everything else in this post: Python has the immutable
+*types*, but no way to make immutability a *property of a shared graph*. The last row is
+the only thing that works, and it's the same answer again — the binding is thread-local.
+Not "immutable." **Unshared.**
+
+## Correction 3, and a number we owe you
+
+Two smaller fixes to the last post, since we're here.
+
+**We claimed Python has "no RAII / scoped locking."** That was wrong and lazy —
+`with lock:` *is* scoped locking, with deterministic exception-safe release, doing
+exactly what `std::lock_guard` does. The real missing piece is different and more
+specific: there is no `Mutex<T>` — no way to bind the lock *to* the data such that you
+cannot touch the data without holding the lock. Python's lock is a separate object
+sitting next to the state it nominally protects, related to it only by a convention
+living in the author's head. Forgetting to unlock was never the failure mode. Touching
+the data somewhere you forgot to lock always was.
+
+**And the overhead number was stale.** We quoted PEP 703's "One thread: 6% / 5%," which
+is a measurement of the 3.12-era prototype. The number that matters is the one in the
+[3.14 release notes](https://docs.python.org/3/whatsnew/3.14.html):
+
+> "The performance penalty on single-threaded code in free-threaded mode is now roughly
+> 5-10%, depending on the platform and C compiler used."
+
+Which happens to be *good news for free-threading* that our own post buried: 3.13's
+free-threaded build carried a far worse penalty because the specializing interpreter
+was disabled, and 3.14 turned it back on. Meanwhile [PEP
+779](https://peps.python.org/pep-0779/) made free-threading **officially supported** in
+3.14 — not experimental.
+
+That strengthens the thesis rather than weakening it. The runtime team shipped, on
+time, at a cost that keeps falling. It's the downstream — a hundred thousand packages
+full of module-level state written against an accidental guarantee — that has no owner
+and no schedule.
+
+## "But Java has globals too, and Java is fine"
+
+It isn't, and that's the point. In Java:
+
+```java
+static int counter;
+counter++;        // eight threads, lost updates, exactly like Python
+```
+
+That is a data race in Java too. Java never solved it — `AtomicInteger` exists
+precisely *because* Java didn't solve it. What Java has is four things Python doesn't:
+
+- **A formal memory model.** The JMM pins down what `volatile`, `synchronized`, and
+  `final` mean. Python's free-threading has no memory model at the Python level — the
+  docs say explicitly that the current behavior is "a description of the current
+  implementation, not a guarantee."
+- **`synchronized` as a keyword**, not a convention borrowed from a library.
+- **A one-line fix that's actually fast.** `ConcurrentHashMap.computeIfAbsent`,
+  `AtomicInteger.incrementAndGet`. Python's equivalents, measured above, run 2× and
+  3.7× *slower* than the same code on a GIL build.
+- **Twenty-five years of tools and habits.** SpotBugs and ErrorProne hunt concurrency
+  bugs; every Java developer has "mutable `static` is dangerous" installed at the
+  reflex level.
+
+But the decisive difference isn't in the language at all. **Java never had a GIL** — so
+no Java library ever shipped un-synchronized shared state and called it correct. It
+would have been a bug on day one, caught in review, flagged by a linter.
+
+Python has thirty years of libraries that are correct **only under the GIL**. And their
+authors weren't sloppy: as the measurements above show, `self.count += 1` genuinely was
+atomic, down to a 100-nanosecond switch interval. They were writing correct code against
+a guarantee the language never wrote down.
+
+So the right analogy isn't "Python is becoming Java." It's: **Python is becoming Java,
+while carrying an ecosystem written before threads existed.** That's the 90% — not a
+missing language feature, an installed base that took a silent promise at its word.
+
+The optimistic reading is real, though, and worth stating: Java proves this world is
+livable. This isn't impossible. It's a decade, plus a set of tools and reflexes Python
+has never needed to build.
+
+## When free-threading is obviously right
+
+Everything above is the bill. Here's the thing that's worth paying it for, because no
+amount of isolation will ever compete:
+
+```
+data loaded :   2164.8 MB RSS   (a 40M-element list)
+8 threads   :   2167.8 MB RSS   (+3.0 MB for all eight workers)
+per-worker copy would cost ~2165 MB × 8 = ~17,318 MB
+```
+
+**2.1 GB of shared data. Eight workers. Three megabytes.** The per-worker-copy version
+of that is 17 GB.
+
+That is not "slower." It is *impossible*. A 30 GB model served from many cores, a large
+DataFrame, a big in-memory index — multiprocessing can't do it, and neither can
+sub-interpreters. That's our architecture's bill, and we've
+[written it down](/blog/42-updates-on-subinterpreter-c-extension-support/) rather than
+hide it. **Free-threading is the only multi-core Python that keeps one heap.** If that's
+your workload, stop reading build logs from people who chose otherwise — including this
+one.
+
+It's also worth being clear about who's paying for what. Meta funded Sam Gross's
+original fork that became PEP 703, and funds
+[Quansight Labs](https://labs.quansight.org/blog/free-threaded-one-year-recap) to port
+the ecosystem — NumPy, SciPy, pandas, scikit-learn, Cython, pybind11. As of early 2026,
+about **51% of the 360 most-downloaded packages that ship native wheels have
+free-threaded wheels**. That's not a hobby project drifting; it's a funded migration
+that knows exactly how expensive it is.
+
+The asymmetry worth naming is a different one: **the people who benefit and the people
+who pay are not the same people.** The benefit lands on ML and data workloads with one
+big shared thing. The bill lands on thousands of library maintainers cleaning up
+module-level state, most of whom will never run a thread and never see a gain.
+
+## So which one should you use?
+
+Three answers, by workload, and only one of them is ours:
+
+**One big thing in memory, many cores on it → free-threading.** No contest, no second
+option, and nothing we build will change that. 17 GB against 3 MB.
+
+**Many independent jobs over the existing ecosystem → isolation.** Web servers, data
+workers. And the honest version of this one: *processes already do that*. Pyronova's
+competition is `gunicorn -w 16`, not free-threading. What
+[we](https://github.com/leocaolab/pyronova) sell isn't multi-core — you already had it —
+it's multi-core without sixteen copies of your interpreter and without serializing
+everything that crosses a worker boundary. One own-GIL sub-interpreter per core
+([PEP 684](https://peps.python.org/pep-0684/)), shared-nothing, so `cache[k]`,
+`self.n += 1`, and the module-level registry are private by construction. You don't audit
+for the bug in this post. You can't express it.
+
+**Everyone else — which is most people → stay on the GIL build and do nothing.** You're
+on `python3.14` today and this entire post is a spectator sport. Adopting 3.14t without
+threads buys you 5–10% single-threaded overhead in exchange for nothing.
+
+And these two roads aren't a referendum. PEP 684 and PEP 703 both live in CPython and
+will keep living there. Pick by workload, not by allegiance.
+
+Ours is the middle row. Free-threading asks a dynamically-typed language with no
+`Mutex<T>`, no concurrent collections, and no Python-level race detector to find every
+lifetime that outlives a frame, in every dependency, forever. Sub-interpreters ask for
+RAM.
+
+For that row, we'd rather buy RAM.
+
+*Every script in this post runs on a stock `uv python install 3.14t` with one env var
+flipped. If a number here doesn't reproduce on your machine, we want to know.*
+
+> Pyronova is open source, if you'd rather multiply the GIL than delete it — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) (`pip install -U pyronova`). Counter-arguments welcome; this is a bet, not a verdict.
