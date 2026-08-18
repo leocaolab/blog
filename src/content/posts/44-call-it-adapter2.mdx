@@ -1,0 +1,121 @@
+---
+title: "Call it Adapter2"
+description: "We found a type in our own codebase called ReviewPassSeam — a word we have never used, never typed, and never seen in anyone else's code. It is an adapter. The good name is why it survived review. On the two rules coding agents run without being told, the ten-second test that separates a legitimate second type from a barnacle, and why naming the ugly thing accurately is the cheapest instrumentation you will ever install."
+date: 2026-08-18
+tags: [ai, agents, code-review, naming, refactoring, design]
+series: "pyre"
+seriesOrder: 44
+draft: false
+---
+
+We found a type in our codebase called `ReviewPassSeam`.
+
+Next to it: `ReviewInput`. `ReviewOutcome`.
+
+We have never used the word "seam." Never typed it. Never read it in anyone else's
+code. It arrived in the repository the way a barnacle arrives on a whale — attached at
+a moment nobody was watching, and now it is structural.
+
+The agent wrote it. And the agent named it *well*, which is the whole problem.
+
+## The euphemism is load-bearing
+
+`ReviewPassSeam` is an adapter. It exists because two things that should talk to each
+other don't, and something has to sit between them and translate.
+
+If it had been named `ReviewAdapter`, we would have deleted it during review. If a
+second one had shown up and forced the name `ReviewAdapter2`, we would have deleted
+both and fixed the actual mismatch. The name would have done the work for us.
+
+"Seam" does the opposite work. It sounds like a design decision. It has the texture of
+a thing somebody chose on purpose, so it survives the read. Nobody challenges a seam.
+
+**A euphemism in a type name is load-bearing.** It is carrying weight the design cannot
+carry by itself. Take the pretty name away and the layer falls over — which tells you
+precisely what the pretty name was there for.
+
+## Two rules nobody wrote down
+
+Coding agents run on two rules that appear in no prompt.
+
+**Rule 1: existence is justification.** Once a thing is in the tree, keeping it requires
+no argument and removing it requires one. That asymmetry is ours; the agent only
+inherits it and then runs it at a hundred times our speed. It is optimizing for "don't
+break anything," and the cheapest way to not break anything is to never take anything
+away.
+
+**Rule 2: add, don't displace.** Adding is verifiable — the tests still pass. Displacing
+requires understanding what the old thing was actually for, and that understanding is
+not checkable by running anything. Offered a verifiable move and a correct one, the
+agent takes verifiable every time.
+
+Compose the two and you have an accretion machine. Every individual addition is
+defensible. Every one passes review. And the interface you were protecting has thirty
+barnacles on the hull.
+
+The frightening part is not that the agent writes bad code. It is that the agent is
+clever enough to find the shortcut and then clever enough to make that shortcut a
+first-class citizen of your codebase, with a doc comment explaining why it belongs
+there. It writes *persuasive* code.
+
+## The test
+
+Here is the test, and it takes ten seconds:
+
+> **Can you say what this type is for, without naming the two things it sits between?**
+
+- `StrIntent` — a prompt that already fits; you never needed to compute its budget.
+  Stands alone.
+- `NodeIntent` — a prompt that must be fitted to a budget before it is materialized.
+  Stands alone.
+- `ReviewPassSeam` — "it connects `ReviewInput` to `ReviewOutcome`." There is no
+  sentence. It has no purpose of its own. It is defined entirely by its neighbours.
+
+A type that can only be defined by what it sits between is an adapter. Name it one.
+
+## This is not "delete more code"
+
+The test matters because the *shape* of a legitimate design and the shape of an
+accretion are identical from outside. Both look like two types doing what appears to be
+one job.
+
+We hit this last week on prompt budgeting: fit the goal to whatever token budget remains
+after system and context. The obvious agent move is to convert the whole prompt to a
+node tree and add a compatibility path for the callers that don't need one. Blast
+radius: everything.
+
+What actually landed:
+
+- `goal` gains a `NodeIntent` variant. When it is a node, subtract the system and
+  context tokens — both always required, so they only consume budget — fit the rest,
+  materialize to a user string.
+- `system` and `context` stay `String`. They are always required. You count their
+  tokens. There is nothing to fit.
+- The other thirteen `StrIntent` callers: **not one character changed.**
+
+Two input types, one job, thirteen untouched callers, on a diff that reads exactly like
+a shim.
+
+It isn't one, and the test says why: both sentences stand alone. `StrIntent` is not "the
+old way." It is the input that does not need budgeting — which describes most prompts,
+and always will. Small prompts don't need a budget. That is not legacy, that is a fact
+about prompts.
+
+**A shim is a type defined by history. A design is a type defined by a property.** Same
+diff, opposite verdicts, and the only thing that separates them is whether you can write
+the sentence.
+
+## The rule
+
+Call it `Adapter`. When the second one shows up, call it `Adapter2`.
+
+Not as a joke — as instrumentation. `Adapter2` appears in every import statement, every
+autocomplete, every review. It is a debt figure checked into version control, accruing
+interest somewhere people can see it. Nobody defends `Adapter2` in a design discussion.
+It gets removed on schedule.
+
+`Seam` compounds silently, forever.
+
+So don't hesitate: displace, and keep the interface clean. And when you genuinely cannot
+— when the adapter has to exist for now — give it a name ugly enough that it cannot
+survive the next reading.
