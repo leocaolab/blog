@@ -1,0 +1,228 @@
+---
+title: "isojson: fast JSON where orjson won't load"
+description: "orjson refuses to import in an own-GIL sub-interpreter. So we wrote an orjson-compatible JSON library in pure Rust that does, and found a silent data-corruption bug in simd-json on the way."
+date: 2026-09-22
+tags: [python, rust, json, sub-interpreters, performance, open-source]
+series: "pyre"
+seriesOrder: 45
+draft: false
+---
+
+Eight sub-interpreters, each with its own GIL, all on one process. The whole
+point of this series. Then one line:
+
+```text
+>>> from concurrent import interpreters
+>>> interpreters.create().exec("import orjson")
+ImportError: module orjson.orjson does not support loading in subinterpreters
+```
+
+The fastest JSON library in Python won't come into the room.
+
+That's orjson 3.12.0, measured, not a stale version. And it isn't an oversight.
+orjson's module definition says so explicitly: it declares
+`Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED`, and its type registry keeps
+dozens of Python objects (the `datetime`, `UUID`, `Enum` types, interned method
+names) in process-global `static mut` pointers. Under a per-interpreter GIL
+([PEP 684](https://peps.python.org/pep-0684/), Python 3.12), an object belongs
+to exactly one interpreter. Share it across two and you get reference counts
+mutated under two different locks, and frees landing in the wrong allocator.
+Refusing to load is the correct, honest behaviour.
+
+So this post is about [isojson](https://github.com/leocaolab/isojson): orjson's
+API, byte-identical output for the types it supports, and it loads in strict
+own-GIL sub-interpreters with no override flag. It's pure Rust. On 8
+sub-interpreters it does 4–5× the best orjson can do in a single process.
+
+## The old way around the wall
+
+In [post 42](/blog/42-updates-on-subinterpreter-c-extension-support/) we got
+orjson running inside Pyronova's sub-interpreters anyway. We gave each worker a
+**physical copy** of the extension and loaded it under the compatibility
+override. It works. But you pay one copy's memory, disk and load time per
+worker, plus a whole mechanism to maintain, for what should be the most boring
+dependency in a web framework.
+
+The alternative was stdlib `json`, which is safe everywhere and 2.7–13× slower
+than orjson on the payloads below.
+
+Neither is an answer. The answer is a JSON library built around one rule.
+
+## The rule: no Python object in process-global state
+
+Everything else in isojson follows from that rule.
+
+- **Multi-phase init, per-interpreter state.** The module declares
+  `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`. That's only honest because anything
+  that must outlive a call lives in module state, which CPython creates per
+  interpreter and frees with it. The only process-global pointers isojson
+  touches are CPython's static builtin types and the immortal
+  `None`/`True`/`False`, which every interpreter shares by design.
+- **A key cache per interpreter.** Like orjson, `loads` caches recently seen
+  dict keys, so a repeated `"id"` reuses one `str` with its hash already
+  computed. orjson's cache is process-wide. isojson keeps one per interpreter,
+  because a shared cache would hand one interpreter's objects to another.
+- **Borrow, don't keep.** `dumps` borrows objects only for the length of the
+  call, on the calling thread, under the caller's GIL. When a `default=`
+  callback could run arbitrary Python and mutate a container mid-walk, items
+  are also held by a reference for that span.
+- **Exceptions belong to the interpreter.** `isojson.JSONDecodeError`
+  subclasses the *calling* interpreter's `json.JSONDecodeError`, so
+  `except json.JSONDecodeError` works in every interpreter.
+
+The declaration itself is four lines of the module's slot table:
+
+```rust
+PyModuleDef_Slot {
+    slot: Py_mod_multiple_interpreters,
+    value: Py_MOD_PER_INTERPRETER_GIL_SUPPORTED,
+},
+```
+
+The hard part isn't writing those lines. It's making them true.
+
+## Pure Rust, and nothing to babysit
+
+There's no C or C++ anywhere in the dependency tree, and the build never runs
+a C compiler. The only native library isojson links against is libpython. The
+SIMD code (SSE2 on x86_64, NEON on aarch64, both baseline, no runtime
+detection) uses Rust's `core::arch` intrinsics.
+
+What that buys you is a list of things you **don't** do:
+
+- no `_override_multi_interp_extensions_check`, no escape hatches;
+- no copy of the extension per worker;
+- no "import it in the main interpreter first";
+- no pinning calls to one thread, no locks around them.
+
+The only state shared across threads or interpreters is plain data: per-thread
+scratch buffers (bytes only), the JSON parser's one-time CPU-feature detection
+(an atomic), and a single switch for a fast path, which is described next.
+
+One deliberate exception to "public API only": for `str`, CPython 3.12–3.14
+already hold the UTF-8 bytes (compact ASCII data, or a cached UTF-8 copy).
+Reading them straight from the object header skips a function call per string.
+That layout isn't public API, so isojson doesn't trust it blindly. At import it
+reads a set of probe strings both ways, header and official API, and turns the
+fast path on only if every probe agrees. A future CPython that changes the
+layout makes isojson slower, never wrong.
+
+## Choosing a parser: simd-json, not sonic-rs
+
+For `loads` we didn't want another hand-rolled parser. A parser's robustness
+isn't a matter of who wrote it; it's whether it survives a conformance suite
+and adversarial input. So we took two fast pure-Rust parsers and ran them
+side by side on
+[JSONTestSuite](https://github.com/nst/JSONTestSuite) (318 cases, each in its
+own child process so a crash is recorded, not fatal), edge cases that matter
+to a Python library, and raw parse speed:
+
+| | simd-json 0.18.1 | sonic-rs 0.5.10 |
+|---|---|---|
+| must-accept rejected / must-reject accepted | 0 / 0 | 0 / 0 |
+| crashes on the suite | **0** | **2** (stack overflow) |
+| 100,000 nested `[` | clean error at depth 1024 | **process aborts** |
+| `-0` | integer `0` (same as orjson) | float `0.0` |
+| shape of the result | a flat tape; each container carries its length | recursive visitor, or its own DOM |
+
+[simd-json](https://github.com/simd-lite/simd-json) is the Rust port of
+simdjson; [sonic-rs](https://github.com/cloudwego/sonic-rs) is CloudWeGo's
+SIMD JSON library. On raw parse time they trade wins: simd-json is faster on
+floats, sonic-rs on escaped Unicode. Speed was a draw.
+
+The deciding row was the abort. Inside a web server, a JSON library must not
+let one request with a deeply nested body take the whole process down, and a
+stack overflow is an abort you can't catch. The tape was the other reason:
+knowing every list's length up front means isojson creates each list at its
+exact size.
+
+## The bug the tests caught
+
+Then isojson's own parity suite went red on one case:
+
+```python
+>>> isojson.loads('"\\ud800"')
+'\x00'
+```
+
+A lone high surrogate is invalid JSON text for a Python string. orjson rejects
+it, and so did our old parser. simd-json 0.18.1 returned a NUL character. No
+error. Invalid input silently became different data.
+
+`git log -S` tells a small, instructive story. The function that decodes
+`\uXXXX` escapes used to return *how many bytes it wrote*, and `0` meant
+"failed". The high-surrogate branch returned `0`, and callers checked
+`if o == 0 { return Err(...) }`. In 2019 it was wrapped in a `Result`, but that
+branch became `Ok((0, …))`, and the sentinel survived inside a success value.
+Then in October 2023,
+[a refactor](https://github.com/simd-lite/simd-json/commit/29d9998) changed the
+function to return the *code point* instead of the byte count. The `0` kept its
+value and lost its meaning: failure became U+0000, `"\ud800"` became `"\0"`, and
+the `o == 0` checks can never fire again. They're still in the code.
+
+That's the whole argument against encoding errors as values, in two commits. A
+typed error can't quietly change meaning; a magic number can.
+
+The fix is two lines: return the error. It comes with a regression test that
+fails without it (`accepted: "\ud800"`) and passes with it, on both NEON and
+AVX2. It's reported as
+[simd-lite/simd-json#481](https://github.com/simd-lite/simd-json/issues/481)
+with the fix in [#482](https://github.com/simd-lite/simd-json/pull/482). The
+original C++ simdjson is fine, by the way: it returns `false`, and only
+substitutes U+FFFD if you explicitly opt in. Until a release contains the fix,
+isojson pins a patched commit.
+
+Switching to a well-used, heavily fuzzed library did not remove the need to
+test it. It moved the test from "our parser" to "our contract".
+
+## Numbers
+
+Apple M5 Pro (18 cores), CPython 3.14.7, orjson 3.12.0, medians of repeated
+runs. Each worker does 3,000 `loads(dumps(doc))` round trips of a 100-record
+document. The clock covers only the work loop, not interpreter or process
+startup.
+
+| round trips / s | N=1 | N=8 | scaling |
+|---|---:|---:|---:|
+| **isojson, N own-GIL sub-interpreters, one process** | 15,162 | **114,405** | 7.55× |
+| json (stdlib), N own-GIL sub-interpreters | 4,019 | 26,679 | 6.64× |
+| orjson, N own-GIL sub-interpreters | ✗ | ✗ | — |
+| orjson, N threads, one interpreter | 16,277 | 21,703 | 1.33× |
+| orjson, N processes | 22,773 | 149,056 | 6.55× |
+
+In one process, isojson on 8 sub-interpreters does about 5× the best orjson
+can manage here, because orjson's threads all queue on one GIL. It does 4.3×
+stdlib `json` on the same sub-interpreters. On a Linux x86_64 box (AMD Ryzen 7
+7840HS) the same comparison comes out at 3.9× and 3.9×. x86_64 is also harder
+on isojson per call: `dumps` of large record documents is 1.9× slower than
+orjson there, against 1.2× on the Mac. And the row we're not hiding: **orjson on
+8 processes is still faster**, because orjson is faster per call. If you
+already live in multiprocessing and never touch sub-interpreters, keep orjson.
+
+Per call, in a single interpreter, `dumps` is within 1.2× of orjson and about
+2× faster on float-heavy documents. `loads` is 1.1–1.6× slower. The gap is
+mostly fixed per-call cost around the parser (copying the input, since
+simd-json unescapes in place and `bytes` are immutable), and it's next on the
+list.
+
+## What's verified, and what isn't
+
+- **JSONTestSuite:** 318/318. Every must-accept document parses, every
+  must-reject one raises `JSONDecodeError`, nothing crashes.
+- **Parity with orjson:** randomized documents compared byte-for-byte under
+  every supported option, 250,000 floats bit-exact, and matching error types
+  and messages for `dumps`.
+- **Concurrency:** 4 and 8 sub-interpreters, 8 threads in one interpreter,
+  and threads mixed with sub-interpreters. Every worker checks its *own*
+  seeded answer, so a leak shows up as a wrong result, not a lucky crash.
+- **CI:** 12 combinations (Linux x86_64 and arm64, macOS, Windows × CPython
+  3.12/3.13/3.14), each run normally and under `PYTHONMALLOC=debug`.
+- **Not yet:** native `datetime`/`UUID`/`Enum`/dataclass support; those go
+  through `default=` today. Free-threaded builds (3.13t/3.14t) work, but
+  CPython re-enables the GIL when isojson is imported, because we haven't
+  earned the right to claim otherwise.
+
+The rule is small. The work was making every line of the module honest about
+it.
+
+> isojson is open source — [leocaolab/isojson](https://github.com/leocaolab/isojson) (`pip install isojson`). If a number here doesn't reproduce on your machine, we want to know.
