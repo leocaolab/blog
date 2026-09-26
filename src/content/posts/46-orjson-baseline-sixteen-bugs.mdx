@@ -1,0 +1,141 @@
+---
+title: "What we found using orjson as a baseline: sixteen datetime and numpy bugs in 3.12.0"
+description: "Found while testing isojson byte-for-byte against orjson: two crashes, malformed JSON with no error, and datetimes written with the wrong offset. orjson has no issue tracker, so here they are, each with a reproduction."
+date: 2026-09-26
+tags: [python, rust, json, orjson, numpy, datetime, open-source]
+series: "pyre"
+seriesOrder: 46
+draft: false
+---
+
+## Background
+
+We're building [isojson](/blog/45-isojson-json-where-orjson-wont-load/), a JSON library
+for Python that works in multi-interpreter setups: it loads and runs in own-GIL
+sub-interpreters ([PEP 684](https://peps.python.org/pep-0684/)), which orjson refuses
+to do. It's written in pure Rust.
+
+We didn't want a new JSON dialect, so orjson is the baseline: same API, and the test
+suite checks that isojson's output is byte-for-byte identical to orjson's. Every
+difference has to be explained, either as an isojson bug to fix or as an orjson bug
+isojson doesn't copy.
+
+While adding `datetime`, `date`, `time` and numpy `datetime64` support in isojson 0.2,
+we found sixteen inputs on which orjson 3.12.0 crashes, writes invalid JSON, writes a
+wrong value, or raises where Python has an answer. They are listed below.
+
+orjson doesn't take bug reports: its README says *"There is no open issue tracker or
+pull requests due to signal-to-noise ratio"*, and issues are off on its GitHub and
+Codeberg repositories. So we're publishing them here.
+
+**Environment:** orjson 3.12.0 (the current release), Python 3.14.7, numpy 2.5.3,
+pytz 2026.4, macOS arm64. Everything below was re-run on 2026-09-26. Each case is a
+regression test in isojson's
+[`tests/test_divergence.py`](https://github.com/leocaolab/isojson/blob/main/tests/test_divergence.py),
+which runs orjson too.
+
+**Reference:** Python's `isoformat()` for `datetime`, `date` and `time`; for
+`datetime64`, numpy's definition (a count of `unit × multiplier` since 1970, `NaT` for
+no value).
+
+## Crashes
+
+**DV-4b.** A `tzinfo` whose `utcoffset()` raises. Python raises the exception.
+orjson: killed by SIGSEGV.
+
+```python
+class Raising(dt.tzinfo):
+    def utcoffset(self, _): raise ValueError("no offset today")
+
+orjson.dumps(dt.datetime(2026, 1, 1, tzinfo=Raising()))
+```
+
+**DV-8.** A `datetime64` with a multiplied unit (`M8[10ms]`, `M8[2D]`). orjson: killed
+by SIGTRAP. The unit parser has no arm for it and reaches `_ => unreachable!()`
+(`src/ffi/numpy/datetime.rs:118`).
+
+```python
+orjson.dumps(np.array([1], dtype="M8[10ms]"), option=orjson.OPT_SERIALIZE_NUMPY)
+```
+
+**DV-9.** `M8[M]` before 1970 (`1969-12`): crashes or raises `TypeError`.
+
+## Invalid JSON, no error
+
+**DV-14.** A ≥2-D `datetime64` array with an element the 1-D writer rejects (a `NaT` in
+`Y M s ms us`, a year past 9999, a `ps`/`fs`/`as` unit):
+
+```python
+a = np.array([["NaT"], ["2026-01-01"]], dtype="M8[s]")
+orjson.dumps({"x": a, "y": 1}, option=orjson.OPT_SERIALIZE_NUMPY, default=lambda o: None)
+```
+
+```text
+b'{"x":[[,["2026-01-01T00:00:00"]],"y":1}'
+```
+
+No exception, and `default` is not called. `json.loads` fails at character 7. The row
+writer's error is discarded at `src/serialize/numpy/array.rs:136`:
+
+```rust
+let _ = array.write(buf);
+```
+
+The same array in 1-D raises `TypeError`.
+
+## Wrong values
+
+| # | Input | Reference | orjson 3.12.0 |
+|---|---|---|---|
+| DV-1 | offset `+05:59:30` | `+05:59:30` | `+05:60` |
+| DV-1 | offset `-00:00:01` | `-00:00:01` | `-00:00` |
+| DV-1 | `America/New_York` (zoneinfo), 1850 | `-04:56:02` | `-04:56` |
+| DV-3 | pytz `localize(2026-03-07 12:00)` + 2 days, not normalized | `2026-03-09T12:00:00-05:00` | `2026-03-09T12:00:00-04:00` |
+| DV-4a | `utcoffset()` returns `None` | no offset | `+00:00` |
+| DV-15 | `utcoffset()` returns `5` (an int) | `TypeError` | `+00:00` |
+| DV-15 | `utcoffset()` returns `timedelta(hours=25)` | `ValueError` | `+01:00` |
+| DV-15 | `utcoffset()` returns `"oops"` (a str) | `TypeError` | `+4294681896:4294967264` (differs per run) |
+| DV-17 | `time(0, 0, 1, 75652)` | `00:00:01.075652` | `00:00:01.75652` |
+| DV-5 | `datetime64` NaT, unit `ns` | `null` | `"1677-09-21T00:12:43.145224"` |
+| DV-6 | NaT, units `W D h m` | `null` | `"1970-01-01T00:00:00"` |
+| DV-11 | `M8[m]` 307445734561825861 | year 584554051223 | `"1970-01-01T00:00:44"` |
+
+Notes on the table:
+
+- DV-1 rounds the offset to the minute without carrying into the hour. RFC 3339 defines
+  `-00:00` as "offset unknown". `zoneinfo` zones use local mean time before standard
+  time, and those offsets have seconds.
+- DV-17 affects `time` with a microsecond from 10000 to 99999. `datetime` is not
+  affected.
+- DV-5's value is the i64 minimum in nanoseconds read as a timestamp. DV-6 and DV-11
+  overflow in the conversion to seconds.
+
+## Raises where there is an answer
+
+| # | Input | Reference | orjson 3.12.0 |
+|---|---|---|---|
+| DV-7 | NaT in `Y M s ms us`, generic NaT | `null` | `TypeError` |
+| DV-10 | `M8[D…us]` on `9999-12-31` | `"9999-12-31T00:00:00"` | `TypeError` (range ends `9999-12-30T22:00`) |
+| DV-12 | `time` with `tzinfo` | `"01:00:00+00:00"` | `TypeError` |
+| DV-13 | generic-unit `datetime64` holding a value | no ISO answer | `TypeError: unsupported numpy.datetime64 unit: NaT` (the value isn't NaT) |
+| DV-16 | units `ps`, `fs`, `as` | floored to µs | `TypeError`, even with `default` |
+
+(DV-2 was merged into DV-1; sixteen cases under seventeen numbers.)
+
+## Unaligned arrays
+
+`np.frombuffer(buf, dtype="<f8", offset=1)` is C-contiguous and native-endian but not
+aligned. orjson checks `NPY_ARRAY_C_CONTIGUOUS` and `NPY_ARRAY_NOTSWAPPED`, not
+`NPY_ARRAY_ALIGNED`, and reads the data through `core::slice::from_raw_parts`, whose
+documentation requires the pointer to be "properly aligned" and says "behavior is
+undefined" otherwise. On macOS arm64 the output is currently correct.
+
+## In isojson
+
+isojson 0.2 writes the reference values above. Where there is no ISO answer (a
+generic unit, a year past 9999) or the array can't be read as is (non-native-endian),
+the object goes to `default=` if given, otherwise `dumps` raises with the dtype, flags
+and value attached. Unaligned arrays are read with unaligned loads. For all other
+inputs its output is byte-identical to orjson's.
+
+*isojson is open source — [leocaolab/isojson](https://github.com/leocaolab/isojson) (`pip install isojson`). If a newer orjson fixes one of these, or one doesn't reproduce for you, let us know.*
