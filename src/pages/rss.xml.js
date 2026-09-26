@@ -1,11 +1,10 @@
 import rss from "@astrojs/rss"
 import { getCollection } from "astro:content"
 import { SITE } from "../consts.ts"
+import { newestFirst } from "../lib/posts.ts"
 
 export async function GET(context) {
-  const posts = (await getCollection("posts", ({ data }) => !data.draft)).sort(
-    (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
-  )
+  const posts = (await getCollection("posts", ({ data }) => !data.draft)).sort(newestFirst)
   return rss({
     title: SITE.title,
     description: SITE.description,

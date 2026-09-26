@@ -3,10 +3,9 @@ import { getCollection } from "astro:content"
 import BaseLayout from "../layouts/BaseLayout.astro"
 import { SITE } from "../consts.ts"
 import { getSeriesList } from "../lib/series.ts"
+import { newestFirst } from "../lib/posts.ts"
 
-const posts = (await getCollection("posts", ({ data }) => !data.draft)).sort(
-  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
-)
+const posts = (await getCollection("posts", ({ data }) => !data.draft)).sort(newestFirst)
 const recent = posts.slice(0, 5)
 const series = await getSeriesList()
 const fmt = (d: Date) =>

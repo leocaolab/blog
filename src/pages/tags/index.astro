@@ -9,7 +9,7 @@ for (const post of posts) {
     counts.set(tag, (counts.get(tag) ?? 0) + 1)
   }
 }
-const tags = [...counts.entries()].sort((a, b) => b[1] - a[1])
+const tags = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
 ---
 
 <BaseLayout title="Topics" description="Browse posts by topic.">

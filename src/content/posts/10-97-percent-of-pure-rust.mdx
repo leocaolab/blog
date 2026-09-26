@@ -31,7 +31,7 @@ The contenders: Actix-web and Axum as the pure-Rust ceiling, Pyronova in two mod
 | 2 | Axum (pure Rust, same stack as Pyronova) | 223,845 | 220,891 | 0.86ms | 14 MB |
 | 3 | **Pyronova SubInterp** | **216,517** | **204,636** | **0.92ms** | **53 MB** |
 | 4 | Pyronova GIL | 100,673 | 97,727 | 2.56ms | 17 MB |
-| 5 | Robyn --fast (22 processes) | 76,504 | 76,051 | 29.62ms | 420 MB |
+| 5 | Robyn `--fast` (22 processes) | 76,504 | 76,051 | 29.62ms | 420 MB |
 
 The headline: a Python web server at **216,517 req/s**, sitting third, brushing against two pure-Rust servers that have no interpreter in the loop at all.
 
@@ -44,7 +44,7 @@ Rankings are fun; ratios are the real story. Because Pyronova is built on the sa
 | Pyronova SubInterp vs Axum (same stack) | 96.7% | 92.6% | Python only costs 3-7% |
 | Pyronova SubInterp vs Actix | 95.8% | 98.0% | Nearly on par with pure Rust |
 | Pyronova GIL vs Axum | 45.0% | 44.2% | Single GIL cuts performance in half |
-| Robyn --fast vs Actix (same stack) | 33.8% | 36.4% | Loses 2/3 of performance |
+| Robyn `--fast` vs Actix (same stack) | 33.8% | 36.4% | Loses 2/3 of performance |
 
 Two rows carry the entire argument.
 
