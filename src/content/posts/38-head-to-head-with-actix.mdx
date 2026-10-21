@@ -37,7 +37,7 @@ On **baseline** plaintext, Actix does 844k rps to our 501k — a 1.68× gap. On 
 
 **json** (2.57×) and **async-db** (6.39×) tell the same story from different angles. The JSON path spends real time constructing a Python dict and serializing it; Actix serializes a Rust struct. And async-db is our weakest showing for an honest architectural reason: our Postgres pool serializes DB waits per worker — one in-flight query per sub-interpreter at a time — while Actix keeps many queries in flight per core. That's a real limitation of the current design, not a tuning miss. One harness note, the same caveat that applies to json-comp: Arena's async-db profile runs a heavier payload and higher concurrency than the `wrk` harness we used elsewhere in this series, which clocked the same path at ~27k rps — so the 7,212 here reflects Arena's profile, not a regression against that number.
 
-> **Pyronova is open source.** Want to rerun the matrix yourself? It's all on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). Star it if real Python-handler throughput is worth the trade, or install it with `pip install pyronova`.
+> **mipyre (formerly Pyronova) is open source.** Want to rerun the matrix yourself? It's all on GitHub — [leocaolab/mipyre](https://github.com/leocaolab/mipyre). Star it if real Python-handler throughput is worth the trade, or install it with `pip install mipyre`.
 
 ## Where Pyronova wins: static files
 

@@ -48,7 +48,7 @@ The fix is to stop assigning and start pulling. A `crossbeam-channel` becomes a 
 
 There's a subtlety worth stating plainly: this is not a strict speedup. Threading a request through a channel (crossbeam send + oneshot await) is one more layer of indirection than grabbing a mutex you were assigned. So on the *best case* — every request identically trivial — the channel is slightly slower. We measured that cost and accepted it, because the best case is not the case that pages you at 3am. You trade a few percent on uniform load to delete a pathological tail on mixed load. That is almost always the right trade for a server.
 
-> **Pyronova is open source.** If wrapping RAII around raw CPython refcounts is your kind of problem, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+> **mipyre (formerly Pyronova) is open source.** If wrapping RAII around raw CPython refcounts is your kind of problem, ⭐ it on GitHub — [leocaolab/mipyre](https://github.com/leocaolab/mipyre) — or `pip install mipyre`.
 
 ## Parsing Python with Python
 

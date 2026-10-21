@@ -81,7 +81,7 @@ async def _process_request(req_id, handler_idx, method, path, query, body):
 
 The thread model tells the story. Before: 10 OS threads, concurrency = 10. After: 10 workers each running an asyncio loop plus a fetcher thread — 20 OS threads, concurrency in the **thousands**, because concurrency is now a count of suspended coroutines, not of parked threads.
 
-> **Pyronova is open source.** If letting Python drive the async loop intrigues you, ⭐ it on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) — or `pip install pyronova`.
+> **mipyre (formerly Pyronova) is open source.** If letting Python drive the async loop intrigues you, ⭐ it on GitHub — [leocaolab/mipyre](https://github.com/leocaolab/mipyre) — or `pip install mipyre`.
 
 ## The number
 

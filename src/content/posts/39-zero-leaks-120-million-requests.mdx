@@ -41,7 +41,7 @@ Then three more phases — path params, JSON POST, a CPU-bound `fib(10)` route �
 
 Zero Non-2xx, zero socket errors, all four endpoints correct afterward, server still alive. That's three things proven at once: the `PyObjRef` RAII wrapper (Drop auto-DECREFs) closes the refcount loop, mimalloc absorbs 90 million alloc/free cycles without fragmenting, and the bounded channel never overflowed into a single 503.
 
-> **Pyronova is open source.** The soak harness and the regression gate that keeps RSS flat are on GitHub — [leocaolab/pyronova](https://github.com/leocaolab/pyronova). If a flat memory line under load earns a ⭐ from you, we'd take it — or just `pip install pyronova`.
+> **mipyre (formerly Pyronova) is open source.** The soak harness and the regression gate that keeps RSS flat are on GitHub — [leocaolab/mipyre](https://github.com/leocaolab/mipyre). If a flat memory line under load earns a ⭐ from you, we'd take it — or just `pip install mipyre`.
 
 ## 120 million requests on Linux
 

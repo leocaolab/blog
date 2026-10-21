@@ -493,7 +493,7 @@ option, and nothing we build will change that. 17 GB against 3 MB.
 **Many independent jobs over the existing ecosystem → isolation.** Web servers, data
 workers. And the honest version of this one: *processes already do that*. Pyronova's
 competition is `gunicorn -w 16`, not free-threading. What
-[we](https://github.com/leocaolab/pyronova) sell isn't multi-core — you already had it —
+[we](https://github.com/leocaolab/mipyre) sell isn't multi-core — you already had it —
 it's multi-core without sixteen copies of your interpreter and without serializing
 everything that crosses a worker boundary. One own-GIL sub-interpreter per core
 ([PEP 684](https://peps.python.org/pep-0684/)), shared-nothing, so `cache[k]`,
@@ -517,4 +517,4 @@ For that row, we'd rather buy RAM.
 *Every script in this post runs on a stock `uv python install 3.14t` with one env var
 flipped. If a number here doesn't reproduce on your machine, we want to know.*
 
-> Pyronova is open source, if you'd rather multiply the GIL than delete it — [leocaolab/pyronova](https://github.com/leocaolab/pyronova) (`pip install -U pyronova`). Counter-arguments welcome; this is a bet, not a verdict.
+> mipyre (formerly Pyronova) is open source, if you'd rather multiply the GIL than delete it — [leocaolab/mipyre](https://github.com/leocaolab/mipyre) (`pip install mipyre`). Counter-arguments welcome; this is a bet, not a verdict.
