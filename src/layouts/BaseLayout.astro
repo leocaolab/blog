@@ -25,6 +25,11 @@ const path = Astro.url.pathname
       publishedTime={publishedTime}
       type={type}
     />
+    <script
+      is:inline
+      defer
+      src="https://static.cloudflareinsights.com/beacon.min.js"
+      data-cf-beacon='{"token": "7a00dd1d63c94135a8a9ac2178e3fade"}'></script>
   </head>
   <body>
     <header class="site-header">
