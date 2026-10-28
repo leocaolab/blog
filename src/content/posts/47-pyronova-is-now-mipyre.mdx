@@ -1,0 +1,53 @@
+---
+title: "Pyronova is now mipyre"
+description: "The per-core Python server from this series has a new name and a public repo: mipyre, the Multi-Interpreter Python Runtime Environment. What changed, what didn't, and where to find it."
+date: 2026-10-27
+tags: [python, rust, sub-interpreters, open-source]
+series: "pyre"
+seriesOrder: 47
+draft: false
+---
+
+The project this series has followed — first as Pyre, then as Pyronova — has a new name: **mipyre**.
+
+The name says what it is: **M**ulti-**I**nterpreter **Py**thon **R**untime **E**nvironment. One process, one CPython sub-interpreter per core, each with its own GIL, behind an HTTP server written in Rust.
+
+## Where it lives
+
+- Code: [github.com/leocaolab/mipyre](https://github.com/leocaolab/mipyre)
+- Package: `pip install mipyre` (Python 3.14, the regular build with the GIL; wheels for Linux x86_64 and macOS arm64)
+
+```python
+from mipyre import Mipyre
+
+app = Mipyre()
+
+
+@app.get("/hello/{name}")
+def hello(req, name):
+    return {"message": f"Hello, {name}!"}
+
+
+if __name__ == "__main__":
+    app.run()
+```
+
+## What changed
+
+Everything carries the new name, the same way the last rename did — no compatibility alias:
+
+- the package and import: `pyronova` → `mipyre`
+- the app class: `Pyronova` → `Mipyre`
+- the CLI: `mipyre run`, `mipyre dev`, `mipyre routes`
+- environment variables: `PYRONOVA_*` → `MIPYRE_*`
+- the config table: `[tool.mipyre]`
+
+mipyre's version numbers start over: 1.0.0 was its first public release, on October 21, and it is at 3.0.1 today. Those releases changed more than the name — settings, router registration and some defaults moved too — so moving an app from Pyronova is not a pure find-and-replace. The [changelog](https://github.com/leocaolab/mipyre/blob/main/CHANGELOG.md) lists every breaking change with the spelling to write instead.
+
+## What didn't
+
+The engine. Sub-interpreters with a GIL each, the thread-per-core server, the `process` runtime for C extensions that can't load in a sub-interpreter — everything earlier posts in this series describe is the same code under a new name.
+
+Pyronova 2.10.0 stays on PyPI as it is; new releases ship as mipyre. The older posts in this series keep the names the project had when they were written, but their links now point at the mipyre repo.
+
+> **mipyre is open source.** Find it at [leocaolab/mipyre](https://github.com/leocaolab/mipyre) — star it if per-core Python interests you, or `pip install mipyre` and try to break it.
