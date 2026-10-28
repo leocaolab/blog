@@ -1,0 +1,191 @@
+---
+title: "My coding agent meant to clean up a test box. The rm -rf landed on my Mac."
+description: "One long command across two machines, the same delete written twice — and the extra copy, outside the ssh quotes, ran on my laptop. This time the path was ~/.., which rm refuses anyway. Any other path, and it deletes. Root cause, and the hook I added."
+date: 2026-10-28
+tags: [ai, agents, claude-code, shell, safety]
+draft: false
+---
+
+I run Claude as a coordinator that hands tasks to sub-agents. One of those sub-agents was finishing a task: speeding up a merge gate. Its last step was cleanup. It had a failed run's output sitting on `bluewhale`, my Linux test machine, at `~/b184-out/before-1`, and it wanted that gone.
+
+This is the command it submitted, on my Mac, verbatim except that I replaced my username with `me` and shortened a scratch path:
+
+```bash
+S=/tmp/scratch; sed -i 's|^env.pop("PYRONOVA_TEST_PG_DSN", None)|env.pop("PYRONOVA_TEST_PG_DSN", None)\nenv["PATH"] = os.path.expanduser("~/.local/bin") + ":" + os.path.expanduser("~/.cargo/bin") + ":" + env["PATH"]|' $S/run_gate.py && grep -n PATH $S/run_gate.py && scp -q $S/run_gate.py bluewhale:/home/me/b184-runner.py && ssh bluewhale 'which uv cargo maturin; echo "PATH=$PATH" | head -c 300; echo; ls ~/b184-out/' && rm -rf ~/.. 2>/dev/null; ssh bluewhale 'rm -rf ~/b184-out/before-1'
+```
+
+Read it to the end. The last piece, `ssh bluewhale 'rm -rf ~/b184-out/before-1'`, is the cleanup it meant: inside the quotes, on the test machine. That part ran, and it deleted the right directory.
+
+Just before it, after the `ssh bluewhale '… ls ~/b184-out/'` closes its quote, sits `&& rm -rf ~/.. 2>/dev/null`. That one is outside the quotes. It isn't going to bluewhale. It runs **on my Mac**, where `~` is `/Users/me` and `~/..` is `/Users`.
+
+Claude Code refused that part:
+
+> Permission for this command was denied by a built-in Claude Code safety check, not by the user. … What was flagged: Dangerous rm operation detected: '/Users/me/..'
+
+To be precise about the damage: this exact command would have deleted nothing, even unblocked. [POSIX](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/rm.html) says `rm` must refuse any operand whose last component is `.` or `..`, and [macOS's `rm.c`](https://github.com/apple-oss-distributions/file_cmds/blob/main/rm/rm.c) checks that on every call. `rm -rf ~/..` prints `"." and ".." may not be removed` — here, into `2>/dev/null` — and stops.
+
+That protection covers exactly one spelling. If the stray copy had been `rm -rf ~/b184-out` — the directory it had just listed — and a directory by that name existed on my Mac, or `rm -rf ~`, or `rm -rf ~/../*`, `rm` would have done what it was told, on the wrong machine. The `..` was luck. The mistake is what this post is about.
+
+## Root cause
+
+One intent, written twice, on two sides of a quote mark.
+
+The agent meant one thing: delete `~/b184-out/before-1` on bluewhale. It wrote that delete inside the `ssh` quotes, which is right. It also wrote an `rm -rf ~/..` outside them. Asked afterwards, it said that one was typed by hand, by accident: not a variable that expanded wrong, not text copied from some output. Outside the quotes there is no bluewhale. That copy belongs to the Mac.
+
+Nothing went wrong in the shell. Quoting, tilde expansion, `&&` and `;` all did what they're specified to do. The mistake was a delete written twice in a command where the two copies run on different machines, in a command long enough that the second copy didn't stand out.
+
+## The mistake is the machine, not the path
+
+Bad delete paths happen. What makes this one worth writing about is *where* it pointed. The intent was "clean up the test box." The copy that would have done the damage targeted the one machine that wasn't supposed to be touched at all.
+
+`~` means two different things in that line. Inside the `ssh` quotes it's my home on bluewhale. Outside them it's my home on the Mac. Which machine each word runs on is decided by nothing but quote marks, and in a one-liner that runs `sed`, `grep`, `scp` and two `ssh` sessions, nobody — human or model — is reliably checking them.
+
+A test machine is the place you're allowed to be careless. Your own laptop is not. A single command that mixes the two erases that line.
+
+## Dropping files in ~ is already the dangerous part
+
+Look at what the agent had created that day: `~/b184-gate`, `~/b184-out`, `~/b184-runner.py`. All directly in the home directory, because the coordinator never told it where scratch files go.
+
+That looks harmless when the files are written. It stops being harmless at cleanup. Every file an agent leaves in `~` is a future `rm -rf ~/something`, and every one of those deletes is one path component away from `~` itself. Cut the path short, mistype it, or put it on the wrong side of a quote, and what's left is `~`, or `~/..`, or a directory of mine that happens to share the name. The agent's files sit in the same place as everything I care about, so there is no path it can delete that's safely far from my own.
+
+So I count writing to `~` as the first dangerous action, not the delete. If scratch files live under one dedicated root, every legitimate delete starts with that root, and anything that doesn't is wrong on sight — to me, to the agent, and to a hook.
+
+## Why one slip could do this much
+
+Four things lined up:
+
+1. **One long command spanning two machines.** Editing a file locally, copying it over, probing the remote `PATH`, listing a directory, and deleting, all chained on one line. Quoting is the only thing deciding which machine each piece runs on, and a stray copy on the wrong side of a quote doesn't stand out.
+2. **Scratch files loose in the home directory.** As above: every delete path started with `~/`, one level below home.
+3. **The delete was an afterthought.** It hung off the tail of an unrelated chain, with no `ls` of the target first and its errors sent to `/dev/null`. That's a delete written by something that doesn't intend to look at the result.
+4. **The coordinator's brief.** The Claude session that dispatched the sub-agent told it to "clean up the temporary stuff you created" — and, that same day, asked for scratch cleanup again and again. It kept pushing the number of deletes up and never said a word about how to do them. In its own retro, it put it this way: it assumed the sub-agent would delete carefully, so it left the "how" to the sub-agent.
+
+None of these is exotic. Together they mean one slip is all it takes.
+
+## What stopped it, and what that's worth
+
+It wasn't anything I'd built. It was Claude Code's own check.
+
+Claude Code treats certain directories as [critical paths](https://code.claude.com/docs/en/permission-modes) — the filesystem root, your home directory, your working directory and its parents — and checks `rm` and `rmdir` commands against them before they run. According to the docs, this is one of the things it doesn't auto-approve "in any mode, including `bypassPermissions`." So even with permission prompts skipped, this particular command would have been stopped.
+
+The same page is plain about the limits:
+
+> The check can miss some commands, so it doesn't replace an operating-system control such as sandboxing.
+
+> A command the check misses gets no special handling, so anything that approves Bash commands in your session can approve it with no prompt. That includes an allow rule, `bypassPermissions` mode, and the sandbox's auto-allow mode. The check applies to `rm` and `rmdir`, so other approved commands can delete critical paths too.
+
+And in `bypassPermissions` mode you can turn the dangerous-`rm` prompt off.
+
+And the check only knows critical paths. A stray `rm -rf ~/b184-out` on the Mac isn't one: it's an ordinary directory under home, and with prompts skipped it would simply run. Neither the built-in check nor `rm`'s `..` rule asks which machine you meant.
+
+So that night, nothing I'd built stood between a cleanup meant for the test box and my laptop. What saved me was a spelling `rm` happens to refuse and a check that happens to recognize it.
+
+## The second line
+
+Claude Code runs [`PreToolUse` hooks](https://code.claude.com/docs/en/hooks) before tool calls. The hook gets the call as JSON on stdin, with the command in `tool_input.command`. If it exits with code 2, the call is blocked, and whatever it wrote to stderr is what the agent sees as the reason.
+
+This is the hook I now run on every Bash call:
+
+```python
+#!/usr/bin/env python3
+"""PreToolUse(Bash) guard: refuse recursive/forced rm of home, root or parent paths.
+
+Reads the hook JSON on stdin. Exit 2 (with the reason on stderr) blocks the command;
+exit 0 lets it through. Commands inside quoted strings (ssh host 'rm -rf ...') are
+checked too.
+"""
+import json
+import re
+import shlex
+import sys
+
+SEPARATORS = {";", "&&", "||", "|", "&"}
+PROTECTED = {
+    "~", "~/", "$HOME", "${HOME}", "$HOME/", "${HOME}/", "/", "/home", "/home/",
+    "/Users", "/Users/", "/root", "/root/", "*", "/*", "~/*", "$HOME/*",
+}
+HOME_DIR = re.compile(r"^/(home|Users)/[^/]+/?$")
+
+
+def tokens(text):
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|")
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return text.split()
+
+
+def dangerous_target(arg):
+    if arg in PROTECTED or HOME_DIR.match(arg):
+        return True
+    return ".." in arg.replace("\\", "/").split("/")
+
+
+def check(text, depth=0):
+    toks = tokens(text)
+    for i, tok in enumerate(toks):
+        if depth < 3 and " " in tok:
+            found = check(tok, depth + 1)
+            if found:
+                return found
+        if tok.rsplit("/", 1)[-1] != "rm":
+            continue
+        args = []
+        for t in toks[i + 1:]:
+            if t in SEPARATORS:
+                break
+            args.append(t)
+        flags = "".join(a.lstrip("-") for a in args if a.startswith("-") and a != "--")
+        if not any(c in flags for c in "rRf") and "--recursive" not in args and "--force" not in args:
+            continue
+        for a in args:
+            if not a.startswith("-") and dangerous_target(a):
+                return f"rm {' '.join(args)} (target {a!r})"
+    return None
+
+
+def main():
+    data = json.load(sys.stdin)
+    if data.get("tool_name") != "Bash":
+        return 0
+    found = check(data.get("tool_input", {}).get("command", ""))
+    if found:
+        print(
+            f"Blocked by ~/.claude/hooks/guard_rm.py: {found}. Recursive/forced rm of a home, "
+            "root or parent ('..') path is never allowed. Delete only explicit absolute paths "
+            "under the task's own scratch directory.",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+To turn it on, register it in `~/.claude/settings.json` under `hooks.PreToolUse`, with matcher `"Bash"` and command `python3 -I ~/.claude/hooks/guard_rm.py`.
+
+It doesn't try to work out what will really be deleted. It looks for an `rm` with `-r`, `-R` or `-f`, and blocks it if any target is a home directory, `/`, `/Users`, `/home`, a bare `*`, or any path with a `..` component. Any token with a space in it is parsed again as a command of its own, so an `rm` inside `ssh bluewhale '…'` is checked the same way as one outside the quotes.
+
+I fed it the original command: blocked. `ssh bluewhale 'rm -rf ~/..'`: blocked. The legitimate `ssh bluewhale 'rm -rf ~/b184-out/before-1'`, an absolute-path delete inside a project, `rm -f foo.txt` and `git rm -r --cached foo`: allowed.
+
+On purpose, it blocks more than it needs to. It'll stop an `echo` or a commit message that merely contains `rm -rf ~/..` as text, and it stopped the agent while it was writing up this very incident. I'll take that trade.
+
+Be clear about what it doesn't fix: the actual mistake. A stray `rm -rf ~/b184-out` outside the quotes is an ordinary path, and this hook lets it through on the Mac just as the built-in check would. No pattern match on a path can tell which machine you meant. That part is fixed by the rules below, not by the hook.
+
+It's a tripwire, not a sandbox, and it shares the built-in check's blind spot for anything that isn't `rm`: `find -delete`, `shutil.rmtree`, a script that deletes for you. It also only protects sessions on the machine it's installed on. Claude sessions that run directly on bluewhale need their own copy. If you're going to skip permission prompts, the docs' advice stands: do it in a container or VM, not on the machine you'd hate to lose.
+
+## The rules that go with it
+
+The hook is the last line. The part that changes the odds is how the coordinator hands out work. Every brief it writes for a sub-agent now says:
+
+- Short commands. A destructive step never shares a command with another machine: a remote delete lives entirely inside its own `ssh host '…'`, and that command has no local `rm`.
+- Nothing is written loose in `~`. Scratch files go in `~/scratch/<task>/`, the same path on both machines.
+- A delete is a command of its own. List the target first, then delete it by its full absolute path, under that scratch root. No `..`, no globs, no paths built from `$variables`.
+- Don't send a delete's errors to `/dev/null`. If `rm` complains, you want to see it.
+- No `sudo rm`. If a scratch directory contains root-owned files, stop and ask.
+
+That last one came from the same day. A later cleanup on bluewhale hit root-owned profiling files in a scratch directory, and the agent removed them with `sudo rm -r`. It used the right absolute path and stayed inside the scratch directory, but escalating to delete is a decision for a person to make, not something to do in passing.
+
+The slip was a few extra characters. What made it dangerous was a command long enough to hide them, with the test box and my laptop on the same line — and that the only thing standing between them was a check I didn't write and hadn't read the limits of.
