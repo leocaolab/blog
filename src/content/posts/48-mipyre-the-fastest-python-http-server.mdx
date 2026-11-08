@@ -1,0 +1,68 @@
+---
+title: "mipyre, the fastest Python HTTP server"
+description: "1.6 million requests a second from Python on HttpArena. A Rust core, one interpreter per core, and AI-assisted performance work took its score from 2,000 to over 4,000. Rust underneath and Python on top is how fast Python services will be built."
+date: 2026-11-08
+tags: [python, rust, sub-interpreters, performance, benchmarks]
+series: "pyre"
+seriesOrder: 48
+draft: false
+---
+
+[mipyre](https://github.com/leocaolab/mipyre) is the fastest Python HTTP server on [HttpArena](https://http-arena.com/leaderboard/):
+**1.6 million requests a second**, every one answered by a Python handler. Its score went from
+about 2,000 to over 4,000, and it is heading for 5,000, level with today's native HTTP servers.
+
+Three things got it there.
+
+## A Rust core
+
+Everything around your handler is Rust: the HTTP server, TLS, compression, static files, JSON.
+Python does the one thing it is there for, which is running your code. The rest never waits on
+Python.
+
+The board shows it. On static files over TLS, mipyre ranks **5th of 72** frameworks, right behind
+servers written in Go, Zig and C, and serves 6× the next Python entry. On JSON over TLS and on
+compressed JSON it does **twice** what the next Python framework does. Those are the profiles
+where the work is TLS, compression and serialization, and all of that is Rust.
+
+## One interpreter per core
+
+Since Python 3.12, each sub-interpreter can have its own GIL. mipyre gives every core its own
+interpreter, so plain Python handlers run on all cores at once, in one process. The GIL stops
+being the ceiling.
+
+Our own benchmark shows it. A pure-Python, CPU-bound handler gets **4.1×** the throughput on
+4 cores that the same handler gets on one ordinary interpreter: 1,700 requests a second against
+414, with no code change. On the HttpArena machine mipyre keeps more than 32 cores busy
+serving Python handlers from a single process. The full numbers for every runtime mode are in
+[the benchmark](https://github.com/leocaolab/mipyre/tree/main/benchmarks/public).
+
+## AI-assisted performance work
+
+The score doubled because we did performance work with an AI assistant, and did it with
+discipline. Every change is costed before it is written, every pull request is gated on its
+per-request cost, and every gap to a faster server is closed by reading that server's code.
+That is the tedious, exhaustive work people skip. An assistant does not skip it, and that is
+where the gains came from.
+
+It is all on the record in this series. With the assistant we
+[rewrote the server as thread-per-core and deleted 2,000 lines](/blog/34-one-core-one-thread-one-interpreter-deleting-2000-lines/),
+[ran soak tests to zero leaks over 120 million requests](/blog/39-zero-leaks-120-million-requests/),
+and [audited our own code adversarially](/blog/37-adversarial-auditor-31-bugs/). We wrote up
+[what it does better than ordinary coding](/blog/41-what-we-learned-ai-benchmarks/). The
+result is the score: from about 2,000 to over 4,000.
+
+## Rust + Python, built with an AI assistant
+
+This is where Python is going. Its fastest tools are already Rust underneath:
+[pydantic-core](https://github.com/pydantic/pydantic-core), [Polars](https://github.com/pola-rs/polars),
+[Ruff](https://github.com/astral-sh/ruff), [uv](https://github.com/astral-sh/uv). Both sides
+win. Python gets Rust's speed and safety, and Rust gets Python's ecosystem and its developers.
+
+What held this back was cost. A Rust core is expensive to write, and expensive to tune. An AI
+assistant changes that: it writes the Rust, measures it and keeps pushing it, while you keep
+writing Python. Rust for the engine, Python for the code you own, an AI assistant to build and
+tune the engine. We expect that combination to become a standard way to build fast software,
+starting with web servers.
+
+*mipyre is open source: [leocaolab/mipyre](https://github.com/leocaolab/mipyre). Star it, `pip install mipyre`, and put every core to work.*
