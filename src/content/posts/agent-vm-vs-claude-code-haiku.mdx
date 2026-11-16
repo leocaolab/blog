@@ -9,7 +9,8 @@ draft: false
 Take the cheapest, weakest model in the Claude family. Give it 135 agent tasks: customer
 support where the customer has to flip switches on their own phone, an e-mail-and-calendar
 assistant under prompt-injection attack, a simulated phone with nine apps and 457 APIs.
-Run it twice — once as stock Claude Code, once inside a virtual machine we built for LLMs.
+Run it twice — once as stock Claude Code, once inside the agent VM of TARS, the agent
+framework we're building.
 Same model, same tasks, same task text.
 
 The VM run passed **116 of 135**. Stock Claude Code passed **107**. The VM run cost
@@ -18,6 +19,39 @@ The VM run passed **116 of 135**. Stock Claude Code passed **107**. The VM run c
 We didn't write a single benchmark-specific prompt to get there. That's the part we
 care about most, so we'll be precise about it below — along with what this cost us, and
 what these numbers are *not*.
+
+## What TARS and its agent VM are
+
+[TARS](https://github.com/leocaolab/tars) is an agent framework we're building in Rust.
+You embed it in your own software, as a library or a sidecar. Governance is its core:
+every action passes a gate, every call is audited, and personal data is tokenized before
+the model sees it.
+
+The **agent VM** is how TARS runs a model. Most agent harnesses grow a chat transcript and
+hand the model tools. The VM treats the model more like a CPU:
+
+- **One page per step.** At each step the VM draws a page:
+  - a table of the *capabilities* this run was granted;
+  - a stack of recent results and conversation;
+  - labels for everything older, which sits in a *heap*.
+
+  The model answers with a batch of instructions: call a capability, read or search the
+  heap, open an app's signatures, or return.
+- **The VM keeps the books.** It executes those instructions and decides what the next
+  page shows. A large result folds into the heap as a label and a summary, and the model
+  can pull it back whole in one step. A policy file decides what folds, what stays and for
+  how long.
+- **Computation in Starlark.** When a step needs real computation, such as adding up a
+  table, joining two lists or filtering hundreds of records, the model doesn't do the
+  arithmetic in its head. It writes a short program in
+  [Starlark](https://github.com/bazelbuild/starlark), the deterministic Python dialect
+  designed for Bazel. Starlark can't touch the file system, the network or the system
+  clock. The VM runs the program in a sandbox. The program reads values from the heap, and
+  any capability it calls passes through the same gate as a direct call.
+- **No ambient authority.** The model can reach only what it was granted. It gets no shell,
+  no host file system and no credentials.
+
+The question this post asks: does that structure help a weak model, and what does it cost?
 
 ## What we compared
 
@@ -160,6 +194,9 @@ clears whenever the world changes.
 - **The agent VM:** written in Rust. Each step the model sees one page and answers with a
   batch of instructions. The VM executes them, keeps the books and draws the next page. A
   policy file decides how the page is drawn.
+- **Compute:** a Starlark interpreter in a sandbox, granted as one more capability. On
+  these 135 tasks the model chose to write a program in three AppWorld tasks. Most of
+  this benchmark is lookups, not math.
 - **The governance layer:** every capability call goes through a gate with an effect class
   (pure, read or external), with PII tokenization and an append-only audit log.
 - **A bridge** that exposes the τ², AgentDojo and AppWorld environments as capabilities.
