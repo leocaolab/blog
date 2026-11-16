@@ -1,10 +1,20 @@
 ---
-title: "Same model, a quarter of the cost: putting the weakest Claude in a VM"
-description: "We ran Claude Haiku 5.5 on 135 held-out tasks from τ²-bench, AgentDojo and AppWorld twice — once as plain Claude Code, once inside the TARS agent VM. 116 vs 107 passed, $0.79 vs $3.09, half the prompt tokens. No prompt tuning. Here's what we measured, what we gave up, and what we're not claiming."
+title: "Same model, nine more tasks: putting the weakest Claude in a VM"
+description: "We ran Claude Haiku 5.5 on 135 held-out tasks from τ²-bench, AgentDojo and AppWorld twice — once as plain Claude Code, once inside the TARS agent VM. 116 vs 107 passed, at about the same cost and with half the prompt tokens. No prompt tuning. Here's what we measured, what we gave up, and what we're not claiming."
 date: 2026-11-16
 tags: ["ai", "agents", "benchmarks", "llm", "security", "tars"]
 draft: false
 ---
+
+> **Correction (2026-11-16).** The first version of this post said the VM run cost a
+> quarter as much as stock Claude Code ($0.79 vs $3.09). That was wrong. Our scoring script
+> applied a long-context surcharge to the native arm's *whole-run* prompt total, but the
+> surcharge is charged per request, and no native request came close to the threshold (the
+> largest was 77k tokens). Priced per request on the same card, the native arm cost
+> **$0.71** and the VM **$0.79**, so the VM costs about 11% more. The same script also
+> counted the native arm's steps as tool round-trips rather than model calls; the step
+> counts below are now model calls for both arms. Scores, token counts and the security
+> findings are unchanged. The title and every number touched by this are corrected below.
 
 Take the cheapest, weakest model in the Claude family. Give it 135 agent tasks: customer
 support where the customer has to flip switches on their own phone, an e-mail-and-calendar
@@ -13,8 +23,9 @@ Run it twice — once as stock Claude Code, once inside the agent VM of TARS, th
 framework we're building.
 Same model, same tasks, same task text.
 
-The VM run passed **116 of 135**. Stock Claude Code passed **107**. The VM run cost
-**$0.79** in total. Stock cost **$3.09**.
+The VM run passed **116 of 135**. Stock Claude Code passed **107**. Both cost under a
+dollar for all 135 tasks: **$0.79** for the VM, **$0.71** for stock. The VM sent half
+as many prompt tokens.
 
 We didn't write a single benchmark-specific prompt to get there. That's the part we
 care about most, so we'll be precise about it below — along with what this cost us, and
@@ -101,31 +112,43 @@ what this run produced, not a confidence interval.
 
 ## Tokens and money
 
-Per-task averages (agent tokens only; the τ² customer simulator isn't counted):
+Per-task averages (agent tokens only; the τ² customer simulator isn't counted). Steps are
+model calls. Dollars are each request priced on the same Haiku 5.5 card:
 
 | Benchmark | Prompt tokens, native | Prompt tokens, VM | Output, native | Output, VM | Steps, native | Steps, VM | $ native | $ VM |
 |---|---|---|---|---|---|---|---|---|
-| τ² telecom | 485k | 348k | 3.4k | 18.1k | 14.1 | 18.3 | 0.044 | 0.016 |
-| workspace | 111k | 25k | 1.1k | 1.4k | 5.4 | 3.0 | 0.0099 | 0.0020 |
-| workspace, attacked | 100k | 26k | 1.3k | 1.8k | 4.8 | 3.2 | 0.0071 | 0.0017 |
-| travel | 120k | 34k | 1.9k | 3.3k | 8.2 | 4.0 | 0.0101 | 0.0031 |
-| travel, attacked | 120k | 34k | 2.2k | 2.9k | 7.9 | 4.0 | 0.0118 | 0.0025 |
-| AppWorld | 377k | 185k | 6.3k | 9.7k | 25.4 | 9.0 | 0.051 | 0.012 |
-| **All 135 tasks** | **28.7M** | **13.4M** | **370k** | **755k** | | | **$3.09** | **$0.79** |
+| τ² telecom | 485k | 348k | 3.4k | 18.1k | 13.9 | 18.3 | 0.0088 | 0.0158 |
+| workspace | 111k | 25k | 1.1k | 1.4k | 4.5 | 3.0 | 0.0028 | 0.0020 |
+| workspace, attacked | 100k | 26k | 1.3k | 1.8k | 4.1 | 3.2 | 0.0027 | 0.0017 |
+| travel | 120k | 34k | 1.9k | 3.3k | 5.0 | 4.0 | 0.0032 | 0.0031 |
+| travel, attacked | 120k | 34k | 2.2k | 2.9k | 4.9 | 4.0 | 0.0034 | 0.0025 |
+| AppWorld | 377k | 185k | 6.3k | 9.7k | 9.9 | 9.0 | 0.0103 | 0.0115 |
+| **All 135 tasks** | **28.7M** | **13.4M** | **370k** | **755k** | | | **$0.71** | **$0.79** |
 
-Where the savings come from:
+Why the prompt is half the size:
 
 - **Each page is small.** A native step carries Claude Code's system prompt and its tool
   list, plus an ever-growing conversation. A VM step draws one page. Old results fold into a
   label and a summary in the heap, and the model can pull any of them back whole in one step.
-- **Fewer steps.** On AppWorld, 25.4 steps fell to 9.0. A single VM reply can issue several
-  instructions, and their results come back together.
 - **Capabilities listed by app.** AppWorld's 457 APIs show up on the page as one line per
   app: its name, its API names and a one-line description. The model opens an app to see
   full signatures. That change alone cut AppWorld's prompt per task from 665k to 185k tokens.
 
-Output tokens go *up*, about 2×. The VM's reply format asks the model to say in a sentence
-what it's doing and why, then write instructions. Haiku also thinks at every step.
+Why half the prompt doesn't mean half the bill:
+
+- **Native prompts are almost all cache hits.** About 93% of the native arm's prompt
+  tokens are cache reads, billed at a tenth of the input rate. Claude Code keeps a stable
+  prefix and the cache does its job. A VM page changes more from step to step, so less
+  of it is cached.
+- **Output costs more, and the VM writes more.** Output tokens go *up* about 2×. The
+  VM's reply format asks the model to say in a sentence what it's doing and why, then write
+  instructions, and Haiku also thinks at every step. Output tokens are the most
+  expensive kind.
+- **Steps are about the same.** Counted as model calls, the VM takes fewer steps on
+  AgentDojo and AppWorld and more on τ² telecom (18.3 vs 13.9).
+
+Net: the VM is cheaper on AgentDojo, dearer on telecom and AppWorld, and 11% dearer in
+total. The case for the VM here is the score and the governance, not the bill.
 
 ## Security
 
@@ -208,7 +231,7 @@ clears whenever the world changes.
 | We got | We paid |
 |---|---|
 | +9 tasks with the same model (one run) | **Speed.** Each task takes 1.5–4× the wall-clock of native. Every step starts a fresh CLI process, and output tokens double |
-| 25% of the cost, 46% of the prompt tokens | Folded results sometimes cost a step to fetch: 8.6% of AppWorld steps only read the heap |
+| 46% of the prompt tokens | About 11% **more cost** in total (output-heavy, less cache reuse). Folded results sometimes cost a step to fetch: 8.6% of AppWorld steps only read the heap |
 | No ambient authority: no host access, no credentials in the model | With credentials gone, a task like "what's my password for X?" can't be done |
 | PII tokenization (an e-mail shows only its domain) | Reasoning over values gets harder, so we keep only non-identifying structure such as the domain |
 | Small results (≤4,000 characters) stay on the page whole, so the model stops acting on half-seen data | Injected text up to 4,000 characters stays on the page too. Attack success didn't rise in this run, but the sample is small |
@@ -230,7 +253,7 @@ clears whenever the world changes.
 5. **Wall-clock is order-of-magnitude only.** The machine was shared.
 
 The short version: on the weakest Claude, a machine that decides what the model sees
-beat stock Claude Code on score, cost a quarter as much, and never touched the host. And
+beat stock Claude Code on score, at about the same cost, and never touched the host. And
 nobody wrote a prompt trick to make that happen.
 
 ---
